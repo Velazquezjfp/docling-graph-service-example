@@ -1,0 +1,67 @@
+# docling-graph-service defaults. Every key is overridable via environment variables:
+#   DGS__<SECTION>__<KEY>, e.g. DGS__LLM__MODEL=qwen3-coder  DGS__VLM__ENABLED=false
+# Lists are given as JSON: DGS__DOCLING__OCR_LANGS='["de","en"]'
+# Secrets belong in the environment / .env (see .env.example), not in this file.
+
+llm:                                   # extraction LLM (drives docling-graph)
+  base_url: http://localhost:4000/v1   # LiteLLM proxy; the container uses --network host
+  model: gemini-dev                    # proxy alias; target cluster: the qwen3-coder alias
+  structured_output: true
+  temperature: 0.0
+  timeout_s: 300
+  max_retries: 2
+  context_limit: 128000
+  max_output_tokens: 8192
+  parallel_workers: 2
+
+vlm:                                   # picture description (base_url/api_key default to llm.*)
+  enabled: true
+  model: gemini-dev
+  timeout_s: 120
+  concurrency: 2
+  max_tokens: 2000                     # thinking models spend part of this budget on reasoning
+  min_area_fraction: 0.0
+
+embedding:                             # base_url/api_key default to llm.*
+  enabled: true
+  model: bge-m3
+  dim: 1024
+  batch_size: 64
+  text_prefix: ""                      # "passage: " for multilingual-e5-large
+  timeout_s: 120
+
+chunking:
+  tokenizer: intfloat/multilingual-e5-large   # XLM-R vocabulary, shared with bge-m3
+  max_tokens: 512
+  merge_peers: true                    # adjacent text chunks under one heading; tables/pictures stay separate
+  strip_line_prefixes: ["TESTDOKUMENT ·"]
+  repeated_furniture_min_pages: 3      # text repeated in the page margins on >= N pages is header/footer
+  furniture_band: 0.12
+
+docling:
+  ocr: true
+  ocr_langs: [de, en]
+  images_scale: 3.0
+  table_mode: accurate
+  heading_hierarchy: true
+  numbered_heading_levels: true        # "5.3.1 Titel" -> level 3; unnumbered headings -> parent + 1
+  dehyphenate_table_cells: true        # join words wrapped at a hyphen inside table cells
+  num_threads: 4
+  artifacts_path: null                 # null -> $DOCLING_ARTIFACTS_PATH or online download
+  document_timeout_s: 900
+
+graph:
+  enabled: true
+  extraction_contract: dense           # "direct" only as an explicit override
+  dense_dedupe: "off"
+  provenance: standard
+  chunk_max_tokens: 512                # docling-graph's internal chunker
+  default_ontology_path: ../user-manual-books/handbuch_daten/Ontologie/ontology.yaml
+
+service:
+  host: 0.0.0.0
+  port: 8080
+  max_upload_mb: 50
+  request_deadline_s: 1800
+  cache_dir: null                      # e.g. /var/cache/dgs -> DoclingDocument + result cache
+  log_level: INFO

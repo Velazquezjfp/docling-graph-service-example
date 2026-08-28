@@ -63,10 +63,11 @@ curl -s localhost:8080/healthz
 Build arguments for the enterprise profile: `BASE_IMAGE`, `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`,
 `PIP_TRUSTED_HOST`, `HF_ENDPOINT` (Artifactory mirrors). The image runs fully offline
 (`HF_HUB_OFFLINE=1`, `DOCLING_ARTIFACTS_PATH`, tiktoken cache) and only needs the three endpoints.
-`compose.yaml` ships both profiles (`local` with `network_mode: host`, `enterprise` with env-driven
-endpoints); it is **not exercised here** — the compose plugin is not installed on the dev machine,
-`make docker-run` is the tested path. `/v1/process` is synchronous: give HTTP clients a read timeout
-of at least `service.request_deadline_s` (default 1800 s).
+`compose.yaml` drives build args and runtime settings from a single `.env` (see `.env.example`):
+`docker compose --profile local up -d` on the dev box (host networking), `docker compose --profile enterprise
+build && docker compose --profile enterprise up -d` on a server (published port, Artifactory/proxy build args).
+`/v1/process` is synchronous: give HTTP clients a read timeout of at least `service.request_deadline_s`
+(default 1800 s).
 
 ## HTTP API
 

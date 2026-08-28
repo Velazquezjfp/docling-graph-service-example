@@ -38,43 +38,55 @@ compare against.
 
 ## 2. Getting the image onto the server
 
-**Option A — ship the image built here (recommended when the server has no internet / no HF mirror).**
-The image is self-contained (docling models, EasyOCR de/en, tokenizers, tiktoken; ~4.9 GB):
+Everything is driven by **one `.env` file** in `docling-graph/` (copy `.env.example`): docker compose reads it for
+the build arguments *and* hands it to the container as runtime settings. No multi-line `docker build … \` commands
+(a missing trailing backslash there is what produces `--build-arg: command not found`).
+
+**Option A — ship the image built here (no internet/mirrors needed on the server).** Self-contained (docling models,
+EasyOCR de/en, tokenizers, tiktoken; ~4.9 GB):
 
 ```bash
-# here
-docker build -t dgs:local .                       # already built; re-run after code changes
-docker save dgs:local | gzip > dgs-local.tar.gz   # ~2 GB compressed
-scp dgs-local.tar.gz server:
-# server
+docker save dgs:local | gzip > dgs-local.tar.gz      # here (~2 GB compressed) → scp → on the server:
 gunzip -c dgs-local.tar.gz | docker load
 ```
-or `docker tag dgs:local <registry>/dgs:0.1.0 && docker push …` if you can push to the internal registry.
+Then set `IMAGE=dgs:local` in the server's `.env` and skip the build.
 
-**Option B — build on the server through Artifactory.** Needs the PyPI proxy, the PyTorch-CPU index and a
-HuggingFace remote (docling layout/TableFormer models and the two tokenizers come from HF; EasyOCR weights come
-from GitHub releases via `docling-tools`, which may not be mirrored — if that step fails, use option A):
+**Option B — build on the server (Artifactory + proxy).** Fill the build section of `.env`:
 
 ```bash
-docker build -t dgs:0.1.0 \
-  --build-arg BASE_IMAGE=<registry>/python:3.12-slim \
-  --build-arg PIP_INDEX_URL=https://<artifactory>/api/pypi/pypi/simple \
-  --build-arg PIP_EXTRA_INDEX_URL=https://<artifactory>/api/pypi/pytorch-cpu/simple \
-  --build-arg PIP_TRUSTED_HOST=<artifactory-host> \
-  --build-arg HF_ENDPOINT=https://<artifactory>/api/huggingfaceml/hf .
+BASE_IMAGE=<registry>/python:3.12-slim
+PIP_INDEX_URL=https://<artifactory>/api/pypi/<repo>/simple
+PIP_EXTRA_INDEX_URL=                     # empty: no PyTorch-CPU index -> torch comes from PIP_INDEX_URL (CUDA wheel, runs on CPU, image ~7-8 GB)
+# PIP_TRUSTED_HOST=<artifactory-host>    # only if pip reports CERTIFICATE_VERIFY_FAILED
+# HF_ENDPOINT=https://<artifactory>/api/huggingfaceml/<repo>   # or leave unset and use the proxy:
+HTTP_PROXY=http://<proxy-host>:<port>
+HTTPS_PROXY=http://<proxy-host>:<port>
+NO_PROXY=localhost,127.0.0.1,<artifactory-host>,<registry-host>,.<internal-domain>
+IMAGE=dgs:0.1.0
 ```
+then
 
-**Option C — no Docker.** `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` (with the same
-index args), then pre-download models: `docling-tools models download layout tableformer easyocr --easyocr-lang de
---easyocr-lang en -o /opt/docling-models`, `export DOCLING_ARTIFACTS_PATH=/opt/docling-models`, and once online
+```bash
+docker compose --profile enterprise build      # 10-20 min; downloads: pip packages, docling models (HF), EasyOCR weights (GitHub), tokenizers
+```
+The proxy variables apply to every build step and are not baked into the image. If the build stops, the failing
+step tells you which download the proxy/mirror did not allow: pip (`pip install -r`), HF models
+(`docling-tools models download` / `AutoTokenizer`), or EasyOCR weights from `github.com/JaidedAI` — EasyOCR has no
+mirror override, so if GitHub is blocked use option A.
+
+**Option C — no Docker.** `python3 -m venv .venv && .venv/bin/pip install -e .` (same index args), pre-download
+models: `docling-tools models download layout tableformer easyocr --easyocr-lang de --easyocr-lang en -o
+/opt/docling-models`, `export DOCLING_ARTIFACTS_PATH=/opt/docling-models`, and once online
 `python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('intfloat/multilingual-e5-large');
 AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"` + `python -c "import tiktoken;
-tiktoken.get_encoding('cl100k_base')"`. Then `HF_HUB_OFFLINE=1 .venv/bin/dgs serve`.
+tiktoken.get_encoding('cl100k_base')"`. Then `HF_HUB_OFFLINE=1 .venv/bin/dgs serve`. (`requirements.txt` pins the
+PyTorch-CPU builds `+cpu`; against a plain PyPI index install from `pyproject.toml` as above instead.)
 
 ## 3. Where to put your endpoints — `.env` (the only file you edit)
 
-`config.yaml` holds the defaults; every value can be overridden by `DGS__<SECTION>__<KEY>`. Create `.env` on the
-server from `.env.example`:
+`config.yaml` (baked into the image) holds working defaults for *every* setting; you only override what differs for
+your site with `DGS__<SECTION>__<KEY>` lines in `.env` — typically the three endpoints below. `pyproject.toml`
+contains nothing to configure. The runtime section of `.env`:
 
 ```bash
 # LLM (drives docling-graph). base_url must be the OpenAI-compatible root that has /chat/completions
@@ -98,9 +110,10 @@ DGS__EMBEDDING__MODEL=intfloat/multilingual-e5-large
 DGS__EMBEDDING__DIM=1024
 DGS__EMBEDDING__TEXT_PREFIX="passage: "
 
-# service
-DGS__SERVICE__CACHE_DIR=/var/cache/dgs
-DGS__GRAPH__DEFAULT_ONTOLOGY_PATH=/ontology/ontology.yaml
+# paths (compose sets the in-container cache dir and ontology path itself; this only selects the host directory)
+ONTOLOGY_DIR=/srv/rag/user-manual-books/handbuch_daten/Ontologie
+SELINUX_LABEL=,Z                            # RHEL/CentOS with SELinux enforcing; drop otherwise
+PORT=8080
 ```
 
 Quick check that the endpoints answer the way the service expects (run on the server):
@@ -117,16 +130,21 @@ curl -s $TEI/v1/embeddings -H 'Content-Type: application/json' \
 
 ```bash
 cd <base>/docling-graph
-docker volume create dgs-cache
-docker run -d --name dgs --restart unless-stopped -p 8080:8080 --env-file .env \
-  -v dgs-cache:/var/cache/dgs \
-  -v <base>/user-manual-books/handbuch_daten/Ontologie:/ontology:ro \
-  dgs:local
+docker compose --profile enterprise up -d      # publishes :8080, mounts the ontology read-only, named volume for the cache
+docker compose --profile enterprise logs -f    # docling-graph prints "Phase 1 (skeleton) … Phase 2 (fill) …" progress
+docker compose --profile enterprise down       # stop (the cache volume survives)
 ```
 
-(`--network host` was only needed here because LiteLLM/Ollama live on the local host; with real remote URLs use
-`-p 8080:8080`.) If you mount a *host directory* instead of a named volume for the cache, make it writable for
-uid 10001 (`chmod a+rwX`); otherwise caching is silently skipped (logged as a warning, not an error).
+Equivalent plain `docker run` (if you prefer no compose):
+
+```bash
+docker run -d --name dgs --restart unless-stopped -p 8080:8080 --env-file .env -e DGS__SERVICE__CACHE_DIR=/var/cache/dgs -e DGS__GRAPH__DEFAULT_ONTOLOGY_PATH=/ontology/ontology.yaml -v dgs-cache:/var/cache/dgs -v <base>/user-manual-books/handbuch_daten/Ontologie:/ontology:ro,Z dgs:0.1.0
+```
+
+(The `local` profile uses `network_mode: host` because on the dev box LiteLLM/Ollama live on localhost; with real
+remote URLs the `enterprise` profile publishes the port instead.) If you mount a *host directory* for the cache
+instead of the named volume, make it writable for uid 10001 (`chmod a+rwX`); otherwise caching is skipped with a
+logged warning, never an error.
 
 Verify (the first call waits for the model warm-up, ~30–60 s):
 

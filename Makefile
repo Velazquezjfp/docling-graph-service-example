@@ -3,7 +3,7 @@ PIP ?= .venv/bin/pip
 ZSD ?= ../user-manual-books/handbuch_daten/handbuch/Betriebshandbuch_ZSD.pdf
 IMAGE ?= dgs:local
 
-.PHONY: venv dev test test-integration serve process-zsd docker-build docker-run docker-smoke lint
+.PHONY: venv dev test test-integration serve process-zsd docker-build docker-run docker-smoke compose-up compose-down lint
 
 venv:
 	python3 -m venv .venv && $(PIP) install --upgrade pip
@@ -33,6 +33,12 @@ docker-run:                  ## host networking: the container reaches LiteLLM o
 	  -e DGS__SERVICE__CACHE_DIR=/var/cache/dgs -v dgs-cache:/var/cache/dgs \
 	  -e DGS__GRAPH__DEFAULT_ONTOLOGY_PATH=/ontology/ontology.yaml -v $(ONTOLOGY_DIR):/ontology:ro \
 	  $(IMAGE)
+
+compose-up:                  ## dev box: docker compose --profile local (host networking)
+	docker compose --profile local up -d
+
+compose-down:
+	docker compose --profile local down
 
 docker-smoke:
 	curl -fsS localhost:8080/healthz && curl -fsS localhost:8080/v1/capabilities | head -c 600

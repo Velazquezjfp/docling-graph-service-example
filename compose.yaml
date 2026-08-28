@@ -1,52 +1,50 @@
-# Two profiles, same image. NOTE: not exercised in this repository's verification (the docker
-# compose plugin is not installed on the development machine); `make docker-run` is the tested path.
+# One .env file drives everything: build arguments (registry/index/proxy) and the service's runtime settings
+# (DGS__* variables). Copy .env.example to .env and edit; then:
 #
-#   docker compose --profile local up --build       # LiteLLM/Ollama on the host, host networking
-#   docker compose --profile enterprise up          # remote vLLM/TEI endpoints via env
-services:
-  dgs-local:
-    profiles: [local]
-    build: .
-    image: dgs:local
-    network_mode: host                # reach LiteLLM on localhost:4000 (host.docker.internal is not injected on Linux)
-    environment:
-      DGS__LLM__BASE_URL: http://localhost:4000/v1
-      DGS__LLM__API_KEY: ${DGS__LLM__API_KEY:?set in .env}
-      DGS__LLM__MODEL: ${DGS__LLM__MODEL:-gemini-dev}
-      DGS__VLM__MODEL: ${DGS__VLM__MODEL:-gemini-dev}
-      DGS__EMBEDDING__MODEL: ${DGS__EMBEDDING__MODEL:-bge-m3}
-      DGS__SERVICE__CACHE_DIR: /var/cache/dgs
-      DGS__GRAPH__DEFAULT_ONTOLOGY_PATH: /ontology/ontology.yaml
-    volumes:
-      - dgs-cache:/var/cache/dgs
-      - ../user-manual-books/handbuch_daten/Ontologie:/ontology:ro
+#   docker compose --profile enterprise build        # build on the server through Artifactory / proxy
+#   docker compose --profile enterprise up -d        # run on :8080, remote endpoints from .env
+#   docker compose --profile enterprise logs -f
+#
+#   docker compose --profile local up -d             # dev box: host networking to reach LiteLLM/Ollama on localhost
+#
+# Compose reads .env from this directory for the ${…} interpolation below AND passes it to the container
+# (env_file), so build args and DGS__* runtime variables live side by side in one file.
+x-build: &build
+  context: .
+  args:
+    BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL-https://download.pytorch.org/whl/cpu}   # set empty in .env to disable
+    PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+    HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    HTTP_PROXY: ${HTTP_PROXY:-}
+    HTTPS_PROXY: ${HTTPS_PROXY:-}
+    NO_PROXY: ${NO_PROXY:-}
 
-  dgs-enterprise:
+x-runtime: &runtime
+  env_file: .env
+  environment:
+    DGS__SERVICE__CACHE_DIR: /var/cache/dgs
+    DGS__GRAPH__DEFAULT_ONTOLOGY_PATH: /ontology/ontology.yaml
+  volumes:
+    - dgs-cache:/var/cache/dgs
+    - ${ONTOLOGY_DIR:-../user-manual-books/handbuch_daten/Ontologie}:/ontology:ro${SELINUX_LABEL:-}
+  restart: unless-stopped
+
+services:
+  dgs:                                  # remote server: published port, endpoints from .env
     profiles: [enterprise]
-    build:
-      context: .
-      args:
-        BASE_IMAGE: ${BASE_IMAGE:?internal python:3.12-slim mirror}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:?Artifactory pypi index}
-        PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL:-}
-        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
-        HF_ENDPOINT: ${HF_ENDPOINT:?Artifactory HuggingFace remote}
-    image: dgs:enterprise
-    ports: ["8080:8080"]
-    environment:
-      DGS__LLM__BASE_URL: ${LLM_BASE_URL:?vLLM OpenAI endpoint}
-      DGS__LLM__API_KEY: ${LLM_API_KEY:-none}
-      DGS__LLM__MODEL: ${LLM_MODEL:-qwen3-coder}
-      DGS__VLM__BASE_URL: ${VLM_BASE_URL:-${LLM_BASE_URL}}
-      DGS__VLM__MODEL: ${VLM_MODEL:-granite-vision}
-      DGS__EMBEDDING__BASE_URL: ${EMBEDDING_BASE_URL:?TEI OpenAI endpoint}
-      DGS__EMBEDDING__MODEL: ${EMBEDDING_MODEL:-multilingual-e5-large}
-      DGS__EMBEDDING__TEXT_PREFIX: "passage: "
-      DGS__SERVICE__CACHE_DIR: /var/cache/dgs
-      DGS__GRAPH__DEFAULT_ONTOLOGY_PATH: /ontology/ontology.yaml   # or send ontology_graph per request
-    volumes:
-      - dgs-cache:/var/cache/dgs
-      - ${ONTOLOGY_DIR:?directory containing ontology.yaml}:/ontology:ro
+    build: *build
+    image: ${IMAGE:-dgs:0.1.0}
+    ports: ["${PORT:-8080}:8080"]
+    <<: *runtime
+
+  dgs-local:                            # dev box: LiteLLM/Ollama live on the host -> host networking
+    profiles: [local]
+    build: *build
+    image: ${IMAGE:-dgs:local}
+    network_mode: host
+    <<: *runtime
 
 volumes:
   dgs-cache:

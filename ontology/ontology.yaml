@@ -1,0 +1,873 @@
+# =============================================================================
+# Ontologie für den Korpus "Betriebshandbücher BAVD" (fiktive Testdaten)
+# -----------------------------------------------------------------------------
+# Zweck: semantische Schicht eines RAG-Systems. Diese Datei ist die Quelle für
+#        (a) ein Pydantic-Modell, (b) das Extraktionsschema für Docling-Graph,
+#        (c) die Kanten des Dokument- und des Gesamtgraphen.
+#
+# Lesart der Felder, die für die Codegenerierung wichtig sind:
+#   classes.<Name>.pydantic          -> Klassenname im generierten Modell
+#   classes.<Name>.fields[].type     -> Basistyp (siehe datatypes / enums)
+#   classes.<Name>.fields[].required -> false => Optional[...] = None
+#   classes.<Name>.fields[].many     -> true  => List[...] = []
+#   classes.<Name>.identity          -> Schlüssel für Deduplizierung/Merge
+#   classes.<Name>.cues_de           -> Ankertexte für den Extraktor (Deutsch)
+#   relations[].source / .target     -> Domain / Range (Klassennamen)
+#
+# Sprache des Korpus: Deutsch. Klassennamen sind englisch (Codeeignung),
+# Labels und Ankertexte deutsch (Extraktion).
+# =============================================================================
+
+meta:
+  name: bavd-ops-manual-ontology
+  version: 1.0.0
+  created: 2026-08-25
+  language_of_corpus: de
+  identifier_language: en
+  scope: >
+    Betrieb von IT-Verfahren und zentralen Plattformdiensten einer fiktiven
+    Bundesbehörde: Architektur, Betriebsprozesse, Abhängigkeiten, Störungen,
+    Verantwortlichkeiten. Fünf Dokumente, ein gemeinsames Universum.
+  documents:
+    - {id: "BHB-PLT-0042", file: "Betriebshandbuch_Event-System_2.0.pdf", root_system: "Event-System 2.0"}
+    - {id: "BHB-VRF-0118", file: "Betriebshandbuch_Mars_Dokumentendienste.pdf", root_system: "Mars Dokumentendienste"}
+    - {id: "BHB-VRF-0207", file: "Betriebshandbuch_VPP.pdf", root_system: "VPP"}
+    - {id: "BHB-PLT-0001", file: "Betriebshandbuch_CaaS-Plattform.pdf", root_system: "CaaS-Plattform"}
+    - {id: "BHB-PLT-0007", file: "Betriebshandbuch_ZSD.pdf", root_system: "Zentrale Sicherheitsdienste"}
+  design_notes:
+    - Jeder Knoten und jede Kante trägt Provenienz (Dokument, Kapitel, Seite, Zitat).
+    - Kanten haben eine Polarität. Verneinte Aussagen ("VPP ist kein Mandant") sind
+      Daten, keine fehlenden Kanten. Siehe relations[].polarity und negative_assertions.
+    - Wiederkehrende Tabellen sind die ergiebigsten Extraktionsquellen; sie sind je
+      Klasse und Relation unter table_hints benannt.
+
+# =============================================================================
+# 1. Basistypen — werden zu constrained types im Pydantic-Modell
+# =============================================================================
+datatypes:
+  str:        {python: str}
+  text:       {python: str, note: Freitext, mehrere Sätze}
+  int:        {python: int}
+  float:      {python: float}
+  bool:       {python: bool}
+  date:       {python: datetime.date, input_formats: ["DD.MM.YYYY", "YYYY-MM-DD"]}
+  duration:   {python: "str", examples: ["42 min", "2 h", "1 h 20 min", "1:40", "10 Arbeitstage"], note: "frei formuliert; fuer Auswertungen zusaetzlich nach Minuten normalisieren"}
+  percent:    {python: float, note: "99,95 % -> 99.95 (Dezimalkomma normalisieren)"}
+  hostname:   {python: str, pattern: '^[a-z][a-z0-9-]{1,30}(\.[a-z0-9-]+)*$', examples: ["iam-p01.bavd.intern", "kafka-p01"]}
+  ipv4:       {python: str, pattern: '^(\d{1,3}\.){3}\d{1,3}$'}
+  cidr:       {python: str, pattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'}
+  port:       {python: int, min: 1, max: 65535}
+  url:        {python: str}
+  email:      {python: str}
+  phone_ext:  {python: str, pattern: '^\d{3,4}$', note: Durchwahl}
+  path:       {python: str, examples: ["/opt/archivline/conf/archivline.p12", "kv/dd/prod"]}
+  doc_id:     {python: str, pattern: '^BHB-(PLT|VRF)-\d{4}$'}
+  ci_id:      {python: str, pattern: '^CI-(PLT|VRF)-\d{4}$'}
+  ticket_id:  {python: "str", pattern: "^(ESSUP|DDSUP|VPPSUP|CAASUP|ZSDSUP)-\\d{3,4}$", examples: ["ESSUP-1517", "CAASUP-0351", "ZSDSUP-0247"]}
+  sop_id:     {python: str, pattern: '^SOP-(\d+|(CAAS|ZSD|DD|VPP)-\d{2})$'}
+  fw_id:      {python: str, pattern: '^FW-(ES|DD|VPP|CAAS|ZSD)-\d{3}$'}
+  openitem_id: {python: str, pattern: '^OP(-(CAAS|ZSD))?-\d{2}$'}
+  zone_id:    {python: str, pattern: '^ZONE-[A-Z]+(-[A-Z]{2})?$'}
+  contract_id: {python: str, pattern: '^((RV|WV)-\d{4}-\d{4}|LS-ZRB-\d{4}-\d{4})$'}
+  vault_path: {python: str, pattern: '^kv/[a-z0-9/_<>*-]+$'}
+  k8s_name:   {python: str, pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'}
+  reference:  {python: str, note: "Verweis auf einen anderen Knoten über dessen identity-Wert"}
+
+# =============================================================================
+# 2. Kontrollierte Vokabulare — werden zu Enum-Klassen
+# =============================================================================
+enums:
+  Polarity:            [positive, negative]
+  SystemKind:          [fachverfahren, plattformdienst, basisdienst, fremdsystem]
+  ComponentKind:       [webtier, apptier, worker, broker, gateway, datenbank, adapter, batch, monitoring, sonstige]
+  DeploymentModel:     [container, virtuelle_maschine, appliance, extern_betrieben]
+  EnvironmentKind:     [entwicklung, test, abnahme, produktion, vorabpruefung]
+  DependencyKind:      [identitaet, zertifikat, geheimnis, netz, speicher, plattform, messaging, datenbank, monitoring, dienstleister]
+  Criticality:         [kritisch, hoch, mittel, niedrig]
+  ImpactSeverity:      [keine, eingeschraenkt, ausfall, unbekannt]
+  IncidentSeverity:    [sev1, sev2, sev3]
+  CertRenewalMode:     [automatisch_acme, gemischt, manuell]
+  ProtectionLevel:     [normal, hoch, sehr_hoch]
+  ServiceClass:        [bronze, silber, gold]
+  Protocol:            [tcp, udp, https, http, ldaps, amqp, kafka, jdbc, s3, nfs, ssh]
+  OrgUnitKind:         [behoerde, bereich, team, dienstleister, rechenzentrum]
+  ProcedureTrigger:    [geplant, anlassbezogen, notfall, wiederkehrend]
+  EventDirection:      [eingehend, ausgehend, bidirektional]
+
+# =============================================================================
+# 3. Mixins — auf jeden Knoten und jede Kante angewendet
+# =============================================================================
+mixins:
+
+  Provenance:
+    pydantic: Provenance
+    description: Woher der Wert stammt. Pflicht für jede Extraktion, Grundlage der Zitierbarkeit.
+    fields:
+      - {name: "document_id", type: "doc_id", required: true, description: "Dokument, aus dem die Aussage stammt"}
+      - {name: "chapter", type: "str", required: false, description: "Kapitelnummer, z. B. 5.3", examples: ["5.3", "7.2.4"]}
+      - {name: "page", type: "int", required: false, description: "Seitenzahl im PDF"}
+      - {name: "table_ref", type: "str", required: false, description: "Tabellennummer, z. B. Tabelle 12"}
+      - {name: "figure_ref", type: "str", required: false, description: "Abbildungsnummer, z. B. Abbildung 3"}
+      - {name: "quote", type: "text", required: false, description: "Wörtlicher Satz als Belegstelle, max. 300 Zeichen"}
+      - {name: "confidence", type: "float", required: false, description: "0.0–1.0, Vertrauen des Extraktors"}
+
+  NodeBase:
+    pydantic: NodeBase
+    description: Gemeinsame Felder aller Knoten.
+    fields:
+      - {name: "id", type: "str", required: true, description: "Stabile ID, aus identity gebildet: <class>:<key>, kleingeschrieben"}
+      - {name: "label", type: "str", required: true, description: "Anzeigename wie im Dokument geschrieben"}
+      - {name: "aliases", type: "str", required: false, many: true, description: "Weitere Schreibweisen und Abkürzungen desselben Knotens"}
+      - {name: "description", type: "text", required: false, description: "Ein bis zwei Sätze aus dem Dokument"}
+      - {name: "provenance", type: "Provenance", required: true, many: true, description: "Alle Stellen, an denen der Knoten belegt ist"}
+
+  EdgeBase:
+    pydantic: EdgeBase
+    description: Gemeinsame Felder aller Kanten.
+    fields:
+      - {name: "type", type: "str", required: true, description: "Relationsname aus relations[]"}
+      - {name: "source_id", type: "reference", required: true}
+      - {name: "target_id", type: "reference", required: true}
+      - {name: polarity,    type: Polarity, required: true,  default: positive,
+         description: "negative = die Beziehung wird im Text ausdrücklich verneint"}
+      - {name: "qualifier", type: "text", required: false, description: "Einschränkung im Text (\"nur für neue Sitzungen\", \"nur das Ops-Cockpit\")"}
+      - {name: "provenance", type: "Provenance", required: true, many: true}
+
+# =============================================================================
+# 4. Klassen
+# =============================================================================
+classes:
+
+  # --- 4.1 Dokument- und Organisationsebene ------------------------------------
+  Document:
+    pydantic: Document
+    label_de: Betriebshandbuch
+    identity: {keys: [doc_id], normalize: upper}
+    cues_de: ["Betriebshandbuch", "BHB-", "Verwandte Dokumente", "Dokumentenkennung", "Änderungshistorie"]
+    fields:
+      - {name: "doc_id", type: "doc_id", required: true}
+      - {name: "title", type: "str", required: true}
+      - {name: "version", type: "str", required: false, examples: ["2.3", "3.6"]}
+      - {name: "valid_from", type: "date", required: false, description: "Feld \"Stand\" auf der Titelseite"}
+      - {name: "classification", type: "str", required: false, examples: ["intern · Testdokument – fiktive Daten"]}
+      - {name: "ci_id", type: "ci_id", required: false}
+    table_hints: ["Titelseite", "Änderungshistorie", "Verwandte Dokumente", "Weiterführende Dokumente"]
+
+  OrgUnit:
+    pydantic: OrgUnit
+    label_de: Organisationseinheit
+    identity: {keys: [label], normalize: casefold}
+    cues_de: ["Bereich", "Team", "Referat", "GmbH", "Rechenzentrum", "Fachseite", "Bedarfsträger"]
+    fields:
+      - {name: "kind", type: "OrgUnitKind", required: true}
+      - {name: "short_name", type: "str", required: false, examples: ["IT-B 1", "IT-S 1", "ZRB"]}
+      - {name: "mailbox", type: "email", required: false}
+      - {name: "chat_channel", type: "str", required: false, examples: ["#caas-plattform"]}
+      - {name: "jira_project", type: "str", required: false, examples: ["CAASUP", "ZSDSUP"]}
+    notes: Dienstleister sind OrgUnit mit kind=dienstleister, nicht eigene Klasse.
+
+  Person:
+    pydantic: Person
+    label_de: Person
+    identity: {keys: [label], normalize: "strip_titles_then_casefold", note: "Titel (Dr.) für den Schlüssel entfernen, im label behalten"}
+    cues_de: ["Verantwortlicher", "Vertretung", "Ansprechpartner", "Teamleiter", "Bereichsleitung", "Durchwahl"]
+    fields:
+      - {name: "role_title", type: "str", required: false, examples: ["Teamleiter CaaS-Plattformbetrieb", "PKI-Betrieb"]}
+      - {name: "phone_ext", type: "phone_ext", required: false}
+      - {name: "email", type: "email", required: false}
+      - {name: "org_unit", type: "reference", required: false, description: "OrgUnit, dem die Person zugeordnet ist"}
+    table_hints: ["Rollen und Verantwortlichkeiten", "Ansprechpartner", "Eskalationsweg", "Halter der Unseal-Schlüsselanteile"]
+    merge_warning: >
+      Dieselbe Person tritt in bis zu fünf Dokumenten auf. Durchwahl und Rolle sind
+      der Prüfwert für korrektes Merging; abweichende Werte sind Extraktionsfehler,
+      keine zwei Personen.
+
+  Contract:
+    pydantic: Contract
+    label_de: Vertrag oder Leistungsschein
+    identity: {keys: [contract_id]}
+    cues_de: ["Rahmenvertrag", "Wartungsvertrag", "Leistungsschein", "Serviceklasse", "RV-", "WV-", "LS-ZRB-"]
+    fields:
+      - {name: "contract_id", type: "contract_id", required: true}
+      - {name: "subject", type: "text", required: false, description: "Leistungsgegenstand"}
+      - {name: "valid_until", type: "date", required: false}
+      - {name: "service_class", type: "ServiceClass", required: false}
+
+  # --- 4.2 System- und Architekturebene ---------------------------------------
+  System:
+    pydantic: System
+    label_de: Verfahren oder Dienst
+    description: Das oberste betriebliche Objekt. Jedes Betriebshandbuch beschreibt genau ein System.
+    identity: {keys: [label], normalize: casefold, secondary_keys: [ci_id]}
+    cues_de: ["Verfahren", "Fachverfahren", "Plattformdienst", "Basisdienst", "Anwendung", "Portal", "Plattform"]
+    fields:
+      - {name: "kind", type: "SystemKind", required: true}
+      - {name: "ci_id", type: "ci_id", required: false}
+      - {name: "purpose", type: "text", required: false, description: "Fachlicher Auftrag in einem Satz"}
+      - {name: "deployment_model", type: "DeploymentModel", required: false}
+      - {name: "protection_level", type: "ProtectionLevel", required: false, description: "Schutzbedarf nach Verfügbarkeit"}
+      - {name: "availability_target", type: "percent", required: false}
+      - {name: "rto", type: "duration", required: false}
+      - {name: "rpo", type: "duration", required: false}
+      - {name: "service_hours", type: "str", required: false, examples: ["Mo–Fr 07:30–17:30"]}
+      - {name: cert_renewal_mode, type: CertRenewalMode, required: false,
+         description: Ein Unterscheidungsmerkmal des Korpus, siehe competency_questions Q1}
+    table_hints: ["Betriebskennzahlen", "Verfügbarkeit und Servicezeiten", "Schutzbedarf"]
+
+  Component:
+    pydantic: Component
+    label_de: Komponente oder Dienst
+    description: Technischer Baustein innerhalb eines Systems (Pod, Deployment, Prozess, Adapter).
+    identity: {keys: [label], normalize: casefold, scope: system}
+    cues_de: ["Dienst", "Komponente", "Pod", "Deployment", "StatefulSet", "Service", "Worker", "Adapter"]
+    fields:
+      - {name: "kind", type: "ComponentKind", required: true}
+      - {name: "replicas", type: "int", required: false}
+      - {name: "technology", type: "str", required: false, examples: ["Tomcat 9", "Kafka 3.9", "Keycloak 24.0"]}
+      - {name: "quota", type: "str", required: false, examples: ["12 vCPU / 24 GiB"]}
+      - {name: restart_note, type: text,    required: false,
+         description: Was beim Neustart zu beachten ist (PodDisruptionBudget, Reihenfolge, Mindestabstand)}
+    table_hints: ["Komponenten und Instanzen", "Ressourcen und Replikas"]
+
+  Host:
+    pydantic: Host
+    label_de: Server oder Knoten
+    identity: {keys: [hostname]}
+    cues_de: ["Host", "Knoten", "Server", "virtuelle Maschine", "VIP", "-p01", "-p02"]
+    fields:
+      - {name: "hostname", type: "hostname", required: true}
+      - {name: "ip", type: "ipv4", required: false}
+      - {name: "role", type: "str", required: false, examples: ["Master", "Worker", "Datenbankknoten", "Lastverteiler-VIP"]}
+      - {name: "os", type: "str", required: false, examples: ["RHEL 9.4"]}
+      - {name: "fire_section", type: "str", required: false, description: "Brandabschnitt", examples: ["WE-A", "WE-B", "SD-A"]}
+    table_hints: ["Instanzen der Produktionsumgebung", "Cluster und Knoten", "Portmatrix"]
+
+  Environment:
+    pydantic: Environment
+    label_de: Umgebung oder Cluster
+    identity: {keys: [label], normalize: casefold}
+    cues_de: ["Umgebung", "Cluster", "Produktion", "Abnahme", "Test", "Entwicklung", "ocp-"]
+    fields:
+      - {name: "kind", type: "EnvironmentKind", required: true}
+      - {name: "api_endpoint", type: "str", required: false}
+      - {name: "worker_nodes", type: "int", required: false}
+      - {name: "app_domain", type: "str", required: false, examples: ["apps.prod.caas.bavd.intern"]}
+
+  Namespace:
+    pydantic: Namespace
+    label_de: Namespace
+    identity: {keys: [label]}
+    cues_de: ["Namespace", "Mandant", "Kontingent"]
+    fields:
+      - {name: "label", type: "k8s_name", required: true}
+      - {name: "quota", type: "str", required: false}
+    notes: Die Mandantenbeziehung selbst ist eine Kante (TENANT_OF), keine Eigenschaft.
+
+  NetworkZone:
+    pydantic: NetworkZone
+    label_de: Netzzone
+    identity: {keys: [zone_id]}
+    cues_de: ["Zone", "ZONE-", "Zonenübergang", "Hausnetz", "Metro-Region", "Zonenkonzept"]
+    fields:
+      - {name: "zone_id", type: "zone_id", required: true}
+      - {name: "cidr", type: "cidr", required: false}
+      - {name: "site", type: "str", required: false, examples: ["Metro-Region West", "Hausnetz Süd"]}
+
+  FirewallRule:
+    pydantic: FirewallRule
+    label_de: Firewallregel
+    description: Zeile der Portmatrix. Trägt die Netzkanten des Graphen.
+    identity: {keys: [fw_id]}
+    cues_de: ["Portmatrix", "FW-", "Quelle", "Ziel", "Port", "Zweck", "freigeschaltet"]
+    fields:
+      - {name: "fw_id", type: "fw_id", required: true}
+      - {name: "source_desc", type: "str", required: true, description: "Quelle wie im Dokument benannt"}
+      - {name: "target_desc", type: "str", required: true, description: "Ziel wie im Dokument benannt"}
+      - {name: "port", type: "port", required: false}
+      - {name: "protocol", type: "Protocol", required: false}
+      - {name: "purpose", type: "text", required: false}
+    table_hints: ["Portmatrix", "Firewallregeln", "Zonenübergänge"]
+
+  DataStore:
+    pydantic: DataStore
+    label_de: Datenhaltung
+    description: Datenbank, Topic, Objektspeicher, Volume, Archiv.
+    identity: {keys: [label], normalize: casefold}
+    cues_de: ["Datenbank", "Schema", "Tablespace", "Topic", "Bucket", "PVC", "Volume", "Archiv", "Spool"]
+    fields:
+      - {name: "technology", type: "str", required: false, examples: ["Oracle 19c RAC", "Kafka 3.9", "MinIO", "CephFS"]}
+      - {name: "capacity", type: "str", required: false}
+      - {name: "retention", type: "str", required: false, examples: ["30 Tage", "10 Jahre"]}
+      - {name: "backup_note", type: "text", required: false}
+
+  EventChannel:
+    pydantic: EventChannel
+    label_de: Ereigniskanal
+    description: Broker, Trigger oder Topic, über den Systeme Ereignisse austauschen.
+    identity: {keys: [label]}
+    cues_de: ["Broker", "Trigger", "Ereignistyp", "Dead-Letter", "Zustellung", "Bedarfsträger"]
+    fields:
+      - {name: "channel_kind", type: "str", required: false, examples: ["Broker", "Trigger", "Topic", "Dead-Letter-Topic"]}
+      - {name: "event_type", type: "str", required: false, examples: ["de.bavd.dd.archiv.v1"]}
+      - {name: "direction", type: "EventDirection", required: false}
+      - {name: "guarantee", type: "text", required: false, description: "Zustellgarantie, Wiederholungen, Backoff"}
+
+  # --- 4.3 Identität, Zertifikate, Geheimnisse --------------------------------
+  IdentityClient:
+    pydantic: IdentityClient
+    label_de: IAM-Client
+    description: OIDC-Client, über den ein System die zentrale Anmeldung nutzt.
+    identity: {keys: [label]}
+    cues_de: ["Client", "Client-ID", "Client-Secret", "Realm", "OIDC", "Anmeldung", "Keycloak"]
+    fields:
+      - {name: "realm", type: "str", required: false, default: "bavd-intern"}
+      - {name: "flow", type: "str", required: false, examples: ["Authorization Code + PKCE", "Client Credentials"]}
+      - {name: "secret_rotation", type: "str", required: false, description: "Rotationsregel und Abstimmungspflicht"}
+    table_hints: ["Konsumentenmatrix", "IAM-Clients"]
+
+  Certificate:
+    pydantic: Certificate
+    label_de: Zertifikat
+    identity: {keys: [label], normalize: casefold, secondary_keys: [keystore_path]}
+    cues_de: ["Zertifikat", "Keystore", "Truststore", "Laufzeit", "Ablauf", "SAN", "cert-manager", "keytool", "ACME"]
+    fields:
+      - {name: "subject", type: "str", required: false}
+      - {name: "keystore_path", type: "path", required: false}
+      - {name: "renewal_mode", type: "CertRenewalMode", required: true}
+      - {name: "valid_until", type: "date", required: false}
+      - {name: "lifetime_days", type: "int", required: false, default: 397}
+      - {name: "alert_thresholds", type: "str", required: false, examples: ["30/14/7 Tage"]}
+    table_hints: ["Zertifikatsübersicht", "Zertifikate und Keystores"]
+
+  CertificateAuthority:
+    pydantic: CertificateAuthority
+    label_de: Zertifizierungsstelle
+    identity: {keys: [label]}
+    cues_de: ["Root CA", "Issuing CA", "ausstellende CA", "PKI", "OCSP", "CRL", "ClusterIssuer"]
+    fields:
+      - {name: "ca_role", type: "str", required: false, examples: ["Root", "Issuing"]}
+      - {name: "valid_period", type: "str", required: false, examples: ["2023–2033"]}
+      - {name: "profile", type: "str", required: false, examples: ["SERVER_RSA3072"]}
+
+  SecretStorePath:
+    pydantic: SecretStorePath
+    label_de: Geheimnispfad
+    description: Pfad im zentralen Secret-Management, über den ein System Zugangsdaten bezieht.
+    identity: {keys: [vault_path]}
+    cues_de: ["Vault", "kv/", "Policy", "Geheimnis", "Zugangsdaten", "Unseal", "versiegelt"]
+    fields:
+      - {name: "vault_path", type: "vault_path", required: true}
+      - {name: "content_desc", type: "text", required: false, examples: ["SASL/SCRAM-Zugangsdaten der Broker"]}
+    table_hints: ["Konsumentenmatrix", "Vault-Pfade und Policies"]
+
+  # --- 4.4 Betriebsprozesse ---------------------------------------------------
+  Procedure:
+    pydantic: Procedure
+    label_de: Arbeitsanweisung (SOP)
+    identity: {keys: [sop_id]}
+    cues_de: ["SOP", "Arbeitsanweisung", "Vorgehen", "Ablauf", "Runbook", "Schritt", "Voraussetzung", "Freigabe"]
+    fields:
+      - {name: "sop_id", type: "sop_id", required: true}
+      - {name: "title", type: "str", required: true}
+      - {name: "trigger", type: "ProcedureTrigger", required: false}
+      - {name: "lead_time", type: "duration", required: false, description: "Vorlauf für die Abstimmung"}
+      - {name: "steps", type: "text", required: false, many: true, description: "Schritte in Reihenfolge, je Schritt ein Eintrag"}
+      - {name: "commands", type: "text", required: false, many: true, description: "Wörtliche Befehle aus den Codeblöcken"}
+      - {name: "rollback", type: "text", required: false, description: "Rückfallweg, falls beschrieben"}
+    table_hints: ["SOP-Übersicht", "Standard Operating Procedures"]
+
+  MaintenanceWindow:
+    pydantic: MaintenanceWindow
+    label_de: Wartungsfenster
+    identity: {keys: [label], scope: system}
+    cues_de: ["Wartungsfenster", "Servicezeiten", "Rufbereitschaft", "Betriebszeiten", "Abstimmung"]
+    fields:
+      - {name: "schedule", type: "str", required: true, examples: ["Montag 20:00–00:00", "Dienstag ab 18:00"]}
+      - {name: "notice_period", type: "duration", required: false, examples: ["10 Arbeitstage", "24 h"]}
+    notes: >
+      Unterschiedliche Fenster je System sind gewollt. Widersprüchlich zitierte Fenster
+      in einem Fremddokument sind ein Prüfpunkt für die Pipeline.
+
+  StartupStep:
+    pydantic: StartupStep
+    label_de: Kaltstartschritt
+    description: Ein Schritt der Wiederanlaufreihenfolge des Gesamtverbunds (SOP-CAAS-06).
+    identity: {keys: [order, label]}
+    cues_de: ["Kaltstart", "Wiederanlauf", "Reihenfolge", "Notfall", "Totalausfall", "Voraussetzung"]
+    fields:
+      - {name: "order", type: "int", required: true}
+      - {name: "duration", type: "duration", required: false}
+      - {name: "precondition", type: "text", required: false}
+    notes: Kette über PRECEDES; verbindet alle fünf Dokumente.
+
+  # --- 4.5 Störungen, Auswirkungen, Überwachung -------------------------------
+  Incident:
+    pydantic: Incident
+    label_de: Störung / Vorgang
+    identity: {keys: [ticket_id]}
+    cues_de: ["Vorgang", "Störung", "Incident", "Partnervorgang", "Sev-", "Dauer", "Hauptursache", "Maßnahme"]
+    fields:
+      - {name: "ticket_id", type: "ticket_id", required: true}
+      - {name: "title", type: "str", required: true}
+      - {name: "date", type: "date", required: false}
+      - {name: "severity", type: "IncidentSeverity", required: false}
+      - {name: "duration", type: "duration", required: false}
+      - {name: "root_cause", type: "text", required: false}
+      - {name: "resolution", type: "text", required: false}
+      - {name: "process_change", type: "text", required: false, description: "Was danach verbindlich geändert wurde"}
+    table_hints: ["Incident-Liste", "Störungen mit Verfügbarkeitsbezug"]
+    extraction_note: >
+      Die Spalte "Partnervorgang" ist die wertvollste Kante des Korpus: sie verbindet
+      Dokumente. Immer als PARTNER_TICKET extrahieren, in beide Richtungen.
+
+  FailureMode:
+    pydantic: FailureMode
+    label_de: Störungsbild
+    description: Wiederkehrendes Fehlerbild mit Symptom, Prüfung und Lösung.
+    identity: {keys: [label], scope: system}
+    cues_de: ["Störungsbild", "Symptom", "Fehlerbeschreibung", "Nachbildung", "Erste Prüfungen", "Bild"]
+    fields:
+      - {name: "symptom", type: "text", required: true}
+      - {name: "log_evidence", type: "text", required: false, description: "Charakteristische Logzeile oder Exception"}
+      - {name: "check", type: "text", required: false}
+      - {name: "remedy", type: "text", required: false}
+
+  ImpactStatement:
+    pydantic: ImpactStatement
+    label_de: Auswirkungsaussage
+    description: >
+      Reifizierte Aussage "Ereignis X an Dienst A wirkt bei Konsument B so". Zieht die
+      Auswirkungsmatrizen (BHB-PLT-0001 Tab. 12, BHB-PLT-0007 Tab. 8) in den Graphen.
+      Kern für Fragen der Form "Ich starte X neu — wen trifft es?".
+    identity: {keys: [event, affected_system]}
+    cues_de: ["Auswirkung", "wirkt", "betroffen", "unberührt", "keine", "bei Ausfall", "bei Neustart"]
+    fields:
+      - {name: "event", type: "str", required: true, description: "Auslösendes Ereignis, z. B. 'Vault versiegelt', 'Knoten entleeren'"}
+      - {name: "causing_system", type: "reference", required: false, description: "System, an dem das Ereignis stattfindet"}
+      - {name: "affected_system", type: "reference", required: true}
+      - {name: "severity", type: "ImpactSeverity", required: true}
+      - {name: "symptom", type: "text", required: false, description: "Wortlaut der Zelle"}
+      - {name: "mitigation", type: "text", required: false, description: "Überbrückung, falls genannt"}
+    table_hints: ["Auswirkung von Plattformereignissen je Mandant", "Auswirkungen bei Neustart oder Ausfall", "Vorleistungen und ihre Wirkung bei Ausfall"]
+    negation_note: >
+      severity=keine ist eine ausdrückliche Aussage, nicht das Fehlen von Information.
+      Der Korpus enthält solche Zellen absichtlich (VPP-Spalte).
+
+  Alert:
+    pydantic: Alert
+    label_de: Alarm
+    identity: {keys: [label]}
+    cues_de: ["Alarm", "Alert", "Schwellwert", "meldet", "Rufbereitschaft", "Checkmk", "Prometheus"]
+    fields:
+      - {name: "expression", type: "str", required: false, examples: ["vault_core_unsealed == 0"]}
+      - {name: "threshold", type: "str", required: false}
+      - {name: "reaction", type: "text", required: false, description: "Welche SOP oder welcher Weg folgt"}
+
+  OpenItem:
+    pydantic: OpenItem
+    label_de: Offener Punkt
+    identity: {keys: [openitem_id]}
+    cues_de: ["Offener Punkt", "OP-", "geplant", "in Vorbereitung", "vorgemerkt"]
+    fields:
+      - {name: "openitem_id", type: "openitem_id", required: true}
+      - {name: "subject", type: "text", required: true}
+      - {name: "due", type: "date", required: false}
+      - {name: "owner", type: "reference", required: false, description: "Person"}
+
+  Term:
+    pydantic: Term
+    label_de: Glossarbegriff
+    identity: {keys: [label], normalize: casefold}
+    cues_de: ["Glossar", "Begriff", "bezeichnet", "steht für"]
+    fields:
+      - {name: "definition", type: "text", required: true}
+      - {name: "maps_to", type: "reference", required: false, description: "Knoten, den der Begriff benennt"}
+    notes: Brücke zwischen Nutzerformulierung und Graphknoten — nützlich für Query-Expansion im RAG.
+
+# =============================================================================
+# 5. Relationen
+# =============================================================================
+# cardinality: 1-1 | 1-n | n-1 | n-m
+# Jede Relation erbt EdgeBase (inkl. polarity und provenance).
+relations:
+
+  # --- Dokument und Zuständigkeit ---
+  - name: DOCUMENTS
+    label_de: beschreibt
+    source: Document
+    target: System
+    cardinality: 1-1
+    cues_de: ["Gegenstand dieses Handbuchs", "beschreibt den Betrieb von"]
+
+  - name: MENTIONED_IN
+    label_de: belegt in
+    source: NodeBase
+    target: Document
+    cardinality: n-m
+    note: Wird nicht extrahiert, sondern aus provenance.document_id abgeleitet. Trägt den Dokumentgraphen.
+
+  - name: RELATED_DOCUMENT
+    label_de: verwandtes Dokument
+    source: Document
+    target: Document
+    cardinality: n-m
+    symmetric: false
+    cues_de: ["Verwandte Dokumente", "mitzulesen", "siehe BHB-", "eigenes Betriebshandbuch"]
+    properties:
+      - {name: "relation_note", type: "text", description: "Bezug wie im Text beschrieben"}
+
+  - name: OPERATED_BY
+    label_de: betrieben von
+    source: System
+    target: OrgUnit
+    cardinality: n-1
+    cues_de: ["Betrieb", "verantwortet", "Systembetrieb", "betreibt", "Fachseite"]
+
+  - name: RESPONSIBLE_FOR
+    label_de: verantwortlich für
+    source: Person
+    target: NodeBase
+    cardinality: n-m
+    cues_de: ["Verantwortlicher", "zuständig", "Ansprechpartner", "Produktverantwortlicher"]
+    properties:
+      - {name: "raci", type: "str", examples: ["verantwortlich", "durchführend", "beteiligt", "informiert"]}
+      - {name: "is_deputy", type: "bool", description: "true bei \"Vertretung\""}
+
+  - name: ESCALATES_TO
+    label_de: eskaliert an
+    source: Person
+    target: Person
+    cardinality: n-1
+    cues_de: ["Eskalation", "Eskalationsstufe", "danach", "Krisenstab"]
+    properties:
+      - {name: "level", type: "int", description: "Eskalationsstufe"}
+
+  - name: CONTRACT_COVERS
+    label_de: Vertrag deckt ab
+    source: Contract
+    target: NodeBase
+    cardinality: n-m
+    cues_de: ["Rahmenvertrag", "Leistungsschein", "vertraglich abgedeckt", "nicht Vertragsgegenstand"]
+
+  # --- Struktur und Aufstellung ---
+  - name: HAS_COMPONENT
+    label_de: hat Komponente
+    source: System
+    target: Component
+    cardinality: 1-n
+    cues_de: ["besteht aus", "Komponenten", "Dienste des Verfahrens"]
+
+  - name: RUNS_ON
+    label_de: läuft auf
+    source: Component
+    target: [Host, Namespace, Environment]
+    cardinality: n-m
+    cues_de: ["läuft auf", "betrieben auf", "im Namespace", "auf dem Cluster", "installiert auf"]
+
+  - name: LOCATED_IN
+    label_de: liegt in Zone
+    source: [Host, Environment, Component]
+    target: NetworkZone
+    cardinality: n-1
+    cues_de: ["Zone", "Hausnetz", "Metro-Region", "Brandabschnitt", "Standort"]
+
+  - name: TENANT_OF
+    label_de: Mandant von
+    source: System
+    target: System
+    cardinality: n-1
+    cues_de: ["Mandant", "Mandantenübersicht", "kein Mandant", "Kontingent"]
+    polarity_note: >
+      Ausdrücklich verneinte Fälle im Korpus (VPP ⇸ CaaS-Plattform) als polarity=negative
+      extrahieren, nicht weglassen.
+    properties:
+      - {name: "namespaces", type: "reference", many: true}
+      - {name: "quota", type: "str"}
+
+  - name: USES_DATASTORE
+    label_de: nutzt Datenhaltung
+    source: [System, Component]
+    target: DataStore
+    cardinality: n-m
+    cues_de: ["Datenbank", "speichert", "Ablage", "Schema", "Bucket", "Volume"]
+
+  - name: ALLOWS_TRAFFIC
+    label_de: erlaubt Verkehr
+    source: FirewallRule
+    target: NodeBase
+    cardinality: n-m
+    cues_de: ["Portmatrix", "Quelle", "Ziel", "freigeschaltet", "Regel"]
+    note: Zwei Kanten je Regel (Quelle→Regel, Regel→Ziel) oder eine Kante mit rule-Property; beides zulässig.
+
+  # --- Ereignisfluss ---
+  - name: PUBLISHES_EVENT
+    label_de: veröffentlicht Ereignis
+    source: System
+    target: EventChannel
+    cardinality: n-m
+    cues_de: ["stellt ein", "veröffentlicht", "Produzent", "ausgehend"]
+
+  - name: CONSUMES_EVENT
+    label_de: konsumiert Ereignis
+    source: System
+    target: EventChannel
+    cardinality: n-m
+    cues_de: ["Bedarfsträger", "Konsument", "abonniert", "eingehend", "nicht angebunden"]
+    polarity_note: "VPP ⇸ Event-System ist als polarity=negative belegt."
+
+  # --- Abhängigkeiten (Herz des Graphen) ---
+  - name: DEPENDS_ON
+    label_de: hängt ab von
+    source: [System, Component]
+    target: [System, Component, DataStore, CertificateAuthority, SecretStorePath, IdentityClient, OrgUnit]
+    cardinality: n-m
+    cues_de: ["Vorleistung", "setzt voraus", "benötigt", "hängt ab", "ohne … nicht", "Voraussetzung", "bezieht von"]
+    properties:
+      - {name: "dependency_kind", type: "DependencyKind", required: true}
+      - {name: "criticality", type: "Criticality"}
+      - {name: "failure_effect", type: "text", description: "Was passiert, wenn die Vorleistung ausfällt"}
+      - {name: "bridging", type: "text", description: "Überbrückung / Workaround"}
+    inverse: PROVIDES_TO
+    note: >
+      Die Ringabhängigkeit Vault → PKI → Plattform → Vault ist absichtlich zyklisch.
+      Der Graph muss Zyklen zulassen; die Auflösung steht in den beiden Nabenhandbüchern.
+
+  - name: AUTHENTICATES_VIA
+    label_de: authentisiert über
+    source: System
+    target: IdentityClient
+    cardinality: n-m
+    cues_de: ["Anmeldung", "Client", "Realm", "OIDC", "Single Sign-on", "Keycloak"]
+
+  - name: SECURED_BY
+    label_de: gesichert durch
+    source: [Component, Host, System]
+    target: Certificate
+    cardinality: n-m
+    cues_de: ["Zertifikat für", "TLS", "mTLS", "Keystore", "Route"]
+
+  - name: ISSUED_BY
+    label_de: ausgestellt von
+    source: Certificate
+    target: CertificateAuthority
+    cardinality: n-1
+    cues_de: ["ausgestellt von", "Issuing CA", "unter der Root CA", "ClusterIssuer"]
+
+  - name: READS_SECRET
+    label_de: liest Geheimnis
+    source: [System, Component]
+    target: SecretStorePath
+    cardinality: n-m
+    cues_de: ["Vault", "kv/", "Policy", "zieht Zugangsdaten", "Vault-Agent"]
+
+  # --- Prozesse ---
+  - name: GOVERNED_BY
+    label_de: geregelt durch
+    source: [System, Component, Certificate, Host]
+    target: Procedure
+    cardinality: n-m
+    cues_de: ["nach SOP", "gemäß", "Vorgehen nach", "geregelt in"]
+
+  - name: HAS_MAINTENANCE_WINDOW
+    label_de: hat Wartungsfenster
+    source: System
+    target: MaintenanceWindow
+    cardinality: 1-n
+    cues_de: ["Wartungsfenster", "Servicezeiten", "Betriebszeiten"]
+
+  - name: PRECEDES
+    label_de: geht voraus
+    source: StartupStep
+    target: StartupStep
+    cardinality: 1-n
+    cues_de: ["Voraussetzung", "Schritt", "danach", "erst nach", "Reihenfolge"]
+
+  - name: STEP_RESPONSIBILITY
+    label_de: Schritt verantwortet von
+    source: StartupStep
+    target: [OrgUnit, Person]
+    cardinality: n-1
+
+  # --- Störungen ---
+  - name: AFFECTS
+    label_de: betrifft
+    source: Incident
+    target: [System, Component, DataStore]
+    cardinality: n-m
+    cues_de: ["betroffen", "Umgebung", "Auswirkung", "Ausfall bei"]
+
+  - name: PARTNER_TICKET
+    label_de: Partnervorgang
+    source: Incident
+    target: Incident
+    cardinality: n-m
+    symmetric: true
+    cues_de: ["Partnervorgang", "Folgestörung", "Folgevorgang", "Verteilauftrag", "zugehöriger Vorgang"]
+    note: >
+      Dokumentübergreifende Kante. Beide Seiten nennen die Nummer der Gegenseite;
+      Extraktion aus beiden Dokumenten muss zur selben Kante verschmelzen.
+
+  - name: INSTANCE_OF_FAILURE
+    label_de: Ausprägung von Störungsbild
+    source: Incident
+    target: FailureMode
+    cardinality: n-1
+    cues_de: ["Störungsbild", "siehe Bild", "bekanntes Muster"]
+
+  - name: RESULTED_IN_CHANGE
+    label_de: führte zu Änderung
+    source: Incident
+    target: [Procedure, MaintenanceWindow, Alert, OpenItem]
+    cardinality: n-m
+    cues_de: ["Prozessänderung", "aufgenommen in", "seither", "festgeschrieben", "verankert"]
+
+  - name: DETECTED_BY
+    label_de: erkannt durch
+    source: [FailureMode, Incident]
+    target: Alert
+    cardinality: n-m
+    cues_de: ["Alarm", "meldet", "erkannt über", "unentdeckt"]
+
+  - name: MONITORS
+    label_de: überwacht
+    source: Alert
+    target: [Component, System, Host]
+    cardinality: n-m
+
+  - name: IMPACT_OF
+    label_de: Auswirkung von
+    source: ImpactStatement
+    target: [System, Component]
+    cardinality: n-1
+    note: ImpactStatement.affected_system trägt die Gegenseite; damit ist die Matrix als Graph abgebildet.
+
+  - name: DEFINES_TERM
+    label_de: definiert Begriff
+    source: Document
+    target: Term
+    cardinality: 1-n
+
+# =============================================================================
+# 6. Verneinte Aussagen — bewusst gesetzt, müssen als Kanten mit
+#    polarity=negative im Graphen landen
+# =============================================================================
+negative_assertions:
+  - {relation: "TENANT_OF", source: "VPP", target: "CaaS-Plattform", evidence_doc: "BHB-VRF-0207", note: "Betrieb auf virtuellen Maschinen"}
+  - {relation: "CONSUMES_EVENT", source: "VPP", target: "Event-System 2.0", evidence_doc: "BHB-VRF-0207", note: "kein Ereignisstrom"}
+  - {relation: "DEPENDS_ON", source: "VPP", target: "Vault", evidence_doc: "BHB-PLT-0007", note: "Keystores liegen lokal"}
+  - {relation: "DEPENDS_ON", source: "Event-System 2.0", target: "Oracle", evidence_doc: "BHB-PLT-0042", note: "keine relationale Datenbank"}
+  - {relation: "RUNS_ON", source: "Kafka-Broker", target: "CaaS-Plattform", evidence_doc: "BHB-PLT-0001", note: "Hausnetz Süd, extern betrieben"}
+  - {relation: "RUNS_ON", source: "IAM", target: "CaaS-Plattform", evidence_doc: "BHB-PLT-0007", note: "eigene VMs — löst die Ringabhängigkeit"}
+  - {relation: "RUNS_ON", source: "PKI", target: "CaaS-Plattform", evidence_doc: "BHB-PLT-0007", note: "eigene VMs"}
+extraction_rule_negation: >
+  Auslöser für polarity=negative: "kein", "keine", "nicht", "ohne", "unberührt",
+  "bewusst nicht genutzt", "nicht angebunden", "kein Mandant", "entfällt".
+  Der Qualifier hält den Grund fest. Eine negative Kante darf eine positive Kante
+  desselben Typs zwischen denselben Knoten nicht überschreiben — Konflikte sind zu
+  melden, nicht stillschweigend aufzulösen.
+
+# =============================================================================
+# 7. Kompetenzfragen — was der Graph beantworten muss (Abnahmekriterien)
+# =============================================================================
+competency_questions:
+  - id: Q1
+    question: Wie erneuere ich das TLS-Zertifikat von System X?
+    traversal: System -SECURED_BY-> Certificate -ISSUED_BY-> CertificateAuthority; System -GOVERNED_BY-> Procedure
+    key_fields: [Certificate.renewal_mode, Procedure.steps, Procedure.commands, Certificate.alert_thresholds]
+
+  - id: Q2
+    question: Ich will Komponente Y neu starten — wen trifft es und welche Risiken gibt es?
+    traversal: >
+      Component <-HAS_COMPONENT- System; Component -GOVERNED_BY-> Procedure;
+      ImpactStatement{event~"Neustart"|"entleeren", causing_system=System} -> affected_system;
+      System <-DEPENDS_ON- (abhängige Systeme); Incident -AFFECTS-> Component (Präzedenzfälle)
+    key_fields: [Component.restart_note, ImpactStatement.severity, ImpactStatement.symptom, DEPENDS_ON.failure_effect]
+
+  - id: Q3
+    question: Wer ist mein Ansprechpartner für System X und wie eskaliere ich?
+    traversal: System <-RESPONSIBLE_FOR- Person -ESCALATES_TO-> Person; System -OPERATED_BY-> OrgUnit
+    key_fields: [Person.phone_ext, Person.role_title, OrgUnit.mailbox, OrgUnit.jira_project, ESCALATES_TO.level]
+
+  - id: Q4
+    question: Auf welchen Servern und Ports läuft System X?
+    traversal: System -HAS_COMPONENT-> Component -RUNS_ON-> Host -LOCATED_IN-> NetworkZone; FirewallRule -ALLOWS_TRAFFIC-> ...
+    key_fields: [Host.hostname, Host.ip, FirewallRule.port, FirewallRule.protocol]
+
+  - id: Q5
+    question: Was passiert, wenn der zentrale Dienst Z ausfällt?
+    traversal: ImpactStatement{causing_system=Z} -> alle affected_system; Z <-DEPENDS_ON- Systeme
+    key_fields: [ImpactStatement.severity, ImpactStatement.mitigation]
+    negative_check: Mindestens eine Antwort muss "keine Auswirkung" mit Begründung liefern.
+
+  - id: Q6
+    question: In welcher Reihenfolge fährt der Verbund nach einem Totalausfall an?
+    traversal: StartupStep -PRECEDES-> StartupStep (topologisch), je Schritt STEP_RESPONSIBILITY
+    key_fields: [StartupStep.order, StartupStep.duration, StartupStep.precondition]
+
+  - id: Q7
+    question: Wurde dieses Problem schon einmal gelöst, und wer war beteiligt?
+    traversal: FailureMode <-INSTANCE_OF_FAILURE- Incident -PARTNER_TICKET-> Incident (anderes Dokument)
+    key_fields: [Incident.root_cause, Incident.resolution, Incident.process_change]
+    cross_document: true
+
+# =============================================================================
+# 8. Hinweise für die Extraktion mit Docling-Graph
+# =============================================================================
+extraction:
+  chunking:
+    prefer: Abschnittsgrenzen (h3/h4) und Tabellen als eigene Einheiten
+    keep_table_caption_with_table: true
+    strip_page_header: 'Zeilen, die mit "TESTDOKUMENT ·" beginnen, vor dem Chunking entfernen'
+  tables_first: >
+    Rund 70 % der Kanten stecken in wiederkehrenden Tabellen. Diese zuerst
+    strukturiert auslesen, Freitext danach zur Anreicherung.
+  high_yield_tables:
+    - {caption_contains: "Verwandte Dokumente", yields: [RELATED_DOCUMENT]}
+    - {caption_contains: "Portmatrix", yields: [FirewallRule, ALLOWS_TRAFFIC, LOCATED_IN]}
+    - {caption_contains: "Instanzen", yields: [Host, Component, RUNS_ON]}
+    - {caption_contains: "Mandanten", yields: [TENANT_OF, Namespace, RESPONSIBLE_FOR]}
+    - {caption_contains: "Auswirkung", yields: [ImpactStatement]}
+    - {caption_contains: "Vorleistungen", yields: [DEPENDS_ON]}
+    - {caption_contains: "Kaltstartreihenfolge", yields: [StartupStep, PRECEDES, STEP_RESPONSIBILITY]}
+    - {caption_contains: "Incident", yields: [Incident, PARTNER_TICKET, RESULTED_IN_CHANGE]}
+    - {caption_contains: "Konsumenten", yields: [AUTHENTICATES_VIA, READS_SECRET, SECURED_BY]}
+    - {caption_contains: "SOP", yields: [Procedure, GOVERNED_BY]}
+    - {caption_contains: "Rollen", yields: [Person, RESPONSIBLE_FOR, ESCALATES_TO]}
+    - {caption_contains: "Eskalation", yields: [ESCALATES_TO]}
+    - {caption_contains: "Zertifikat", yields: [Certificate, ISSUED_BY, SECURED_BY]}
+    - {caption_contains: "Glossar", yields: [Term, DEFINES_TERM]}
+  figures:
+    note: >
+      Diagramme sind mit ca. 4 500 px Breite eingebettet, im Layout aber 180 mm breit.
+      images_scale >= 3.0 setzen, sonst sind die Beschriftungen unlesbar. Die Bilder
+      bestätigen vor allem RUNS_ON, LOCATED_IN, DEPENDS_ON und PRECEDES.
+  identifier_regexes_for_linking:
+    document: '\bBHB-(?:PLT|VRF)-\d{4}\b'
+    ticket:   '\b(?:ESSUP|DDSUP|VPPSUP|CAASUP|ZSDSUP)-\d{3,4}\b'
+    sop:      '\bSOP-(?:\d+|(?:CAAS|ZSD|DD|VPP)-\d{2})\b'
+    firewall: '\bFW-(?:ES|DD|VPP|CAAS|ZSD)-\d{3}\b'
+    host:     '\b[a-z][a-z0-9-]{2,}-p\d{2}\b'
+    zone:     '\bZONE-[A-Z]+(?:-[A-Z]{2})?\b'
+  normalization:
+    decimal_comma_to_point: true
+    dates: "DD.MM.YYYY -> ISO 8601"
+    thousands_separator: 'geschütztes Leerzeichen entfernen ("1 284" -> 1284)'
+    case: Bezeichner unverändert lassen, Schlüssel kleinschreiben
+  conflict_policy: >
+    Widersprüchliche Werte für dasselbe Feld nicht überschreiben, sondern als
+    Kandidatenliste mit Provenienz behalten und markieren. Der Korpus enthält
+    absichtlich einen erklärten Fall (48 min vs. 38 min für denselben Vorfall).
+
+# =============================================================================
+# 9. Erwartungswerte zur Prüfung der Extraktion (Stichproben, kein Volltext)
+# =============================================================================
+expected_graph_shape:
+  documents: 5
+  hub_systems: [CaaS-Plattform, Zentrale Sicherheitsdienste]
+  cross_document_partner_tickets: 7
+  documented_cycles:
+    - [Vault, CaaS-Plattform, "BAVD Issuing CA 3", Vault]
+  startup_chain_length: 11
+  systems_min: 5
+  persons_shared_across_documents_min: 6
+  negative_edges_min: 7

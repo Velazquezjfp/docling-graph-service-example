@@ -54,14 +54,17 @@ Then set `IMAGE=dgs:local` in the server's `.env` and skip the build.
 **Option B — build on the server (Artifactory + proxy).** Fill the build section of `.env`:
 
 ```bash
-BASE_IMAGE=<registry>/python:3.12-slim
+BASE_IMAGE=<registry>/python:3.12         # full image: has libGL/glib/curl, so the build needs no Debian repo access
 PIP_INDEX_URL=https://<artifactory>/api/pypi/<repo>/simple
 PIP_EXTRA_INDEX_URL=                     # empty: no PyTorch-CPU index -> torch comes from PIP_INDEX_URL (CUDA wheel, runs on CPU, image ~7-8 GB)
 # PIP_TRUSTED_HOST=<artifactory-host>    # only if pip reports CERTIFICATE_VERIFY_FAILED
 # HF_ENDPOINT=https://<artifactory>/api/huggingfaceml/<repo>   # or leave unset and use the proxy:
-HTTP_PROXY=http://<proxy-host>:<port>
+HTTP_PROXY=http://<proxy-host>:<port>     # set both spellings - apt-get reads only the lowercase ones
 HTTPS_PROXY=http://<proxy-host>:<port>
 NO_PROXY=localhost,127.0.0.1,<artifactory-host>,<registry-host>,.<internal-domain>
+http_proxy=http://<proxy-host>:<port>
+https_proxy=http://<proxy-host>:<port>
+no_proxy=localhost,127.0.0.1,<artifactory-host>,<registry-host>,.<internal-domain>
 IMAGE=dgs:0.1.0
 ```
 then
@@ -69,10 +72,13 @@ then
 ```bash
 docker compose --profile enterprise build      # 10-20 min; downloads: pip packages, docling models (HF), EasyOCR weights (GitHub), tokenizers
 ```
-The proxy variables apply to every build step and are not baked into the image. If the build stops, the failing
-step tells you which download the proxy/mirror did not allow: pip (`pip install -r`), HF models
-(`docling-tools models download` / `AutoTokenizer`), or EasyOCR weights from `github.com/JaidedAI` — EasyOCR has no
-mirror override, so if GitHub is blocked use option A.
+The proxy variables apply to every build step and are not baked into the image. Build arguments must be declared in
+`compose.yaml` (`build.args`) — a variable that only exists in `.env` is not seen by the build. If the build stops,
+the failing step tells you which download the proxy/mirror did not allow: apt (`deb.debian.org`, only with a
+`-slim` base), pip (`pip install -r`), HF models (`docling-tools models download` / `AutoTokenizer`, incl. the
+`cdn-lfs.huggingface.co` redirect), EasyOCR weights from `github.com/JaidedAI` (→ `objects.githubusercontent.com`),
+or tiktoken from `openaipublic.blob.core.windows.net`. EasyOCR has no mirror override, so if GitHub is blocked use
+option A.
 
 **Option C — no Docker.** `python3 -m venv .venv && .venv/bin/pip install -e .` (same index args), pre-download
 models: `docling-tools models download layout tableformer easyocr --easyocr-lang de --easyocr-lang en -o
@@ -141,8 +147,17 @@ Equivalent plain `docker run` (if you prefer no compose):
 docker run -d --name dgs --restart unless-stopped -p 8080:8080 --env-file .env -e DGS__SERVICE__CACHE_DIR=/var/cache/dgs -e DGS__GRAPH__DEFAULT_ONTOLOGY_PATH=/ontology/ontology.yaml -v dgs-cache:/var/cache/dgs -v <base>/user-manual-books/handbuch_daten/Ontologie:/ontology:ro,Z dgs:0.1.0
 ```
 
-(The `local` profile uses `network_mode: host` because on the dev box LiteLLM/Ollama live on localhost; with real
-remote URLs the `enterprise` profile publishes the port instead.) If you mount a *host directory* for the cache
+**Which profile?** The rule is about WHERE the model endpoints live, not which machine you are on:
+
+| | `--profile local` | `--profile enterprise` |
+|---|---|---|
+| Endpoints | on the **host's loopback**: dev-box LiteLLM/Ollama, SSH tunnels on a server | **real remote hostnames** (vLLM/TEI services) |
+| Network | `network_mode: host` — the container shares the host network, so `localhost:<port>` reaches the tunnels; the service listens on the host's 8080 directly (`PORT` ignored) | bridge network, port published as `${PORT:-8080}:8080` |
+| Default image tag | `dgs:local` | `dgs:0.1.0` |
+| Why not the other one | with a bridge network, `localhost` inside the container is the container itself → `errno 111` against tunnels | host networking is unnecessary exposure once endpoints are external |
+
+Development/testing (today's tunnel setup) = `local`; the eventual production deployment = `enterprise`.
+Both read the same `.env`; switching profile does not change any other behaviour. If you mount a *host directory* for the cache
 instead of the named volume, make it writable for uid 10001 (`chmod a+rwX`); otherwise caching is skipped with a
 logged warning, never an error.
 

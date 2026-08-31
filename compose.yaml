@@ -1,25 +1,29 @@
 # One .env file drives everything: build arguments (registry/index/proxy) and the service's runtime settings
 # (DGS__* variables). Copy .env.example to .env and edit; then:
 #
+#   docker compose --profile local up -d             # endpoints on the HOST's loopback (dev box: LiteLLM/Ollama;
+#                                                    #  server: SSH tunnels) -> host networking, same on both machines
 #   docker compose --profile enterprise build        # build on the server through Artifactory / proxy
-#   docker compose --profile enterprise up -d        # run on :8080, remote endpoints from .env
+#   docker compose --profile enterprise up -d        # endpoints are real remote hostnames -> published port
 #   docker compose --profile enterprise logs -f
-#
-#   docker compose --profile local up -d             # dev box: host networking to reach LiteLLM/Ollama on localhost
 #
 # Compose reads .env from this directory for the ${…} interpolation below AND passes it to the container
 # (env_file), so build args and DGS__* runtime variables live side by side in one file.
 x-build: &build
   context: .
   args:
-    BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim}
+    BASE_IMAGE: ${BASE_IMAGE:-python:3.12}          # full image ships libGL/glib/curl -> no apt step, no deb.debian.org
     PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
     PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL-https://download.pytorch.org/whl/cpu}   # set empty in .env to disable
     PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
     HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    # both spellings: apt-get only honours the lowercase ones, pip/curl/python accept either
     HTTP_PROXY: ${HTTP_PROXY:-}
     HTTPS_PROXY: ${HTTPS_PROXY:-}
     NO_PROXY: ${NO_PROXY:-}
+    http_proxy: ${http_proxy:-${HTTP_PROXY:-}}
+    https_proxy: ${https_proxy:-${HTTPS_PROXY:-}}
+    no_proxy: ${no_proxy:-${NO_PROXY:-}}
 
 x-runtime: &runtime
   env_file: .env
@@ -32,14 +36,14 @@ x-runtime: &runtime
   restart: unless-stopped
 
 services:
-  dgs:                                  # remote server: published port, endpoints from .env
+  dgs:                                  # endpoints are real remote hostnames: published port, bridge network
     profiles: [enterprise]
     build: *build
     image: ${IMAGE:-dgs:0.1.0}
     ports: ["${PORT:-8080}:8080"]
     <<: *runtime
 
-  dgs-local:                            # dev box: LiteLLM/Ollama live on the host -> host networking
+  dgs-local:                            # endpoints on the host's loopback (LiteLLM, Ollama, SSH tunnels): host networking
     profiles: [local]
     build: *build
     image: ${IMAGE:-dgs:local}

@@ -55,7 +55,7 @@ script, running the same tests over HTTP, running without a VLM): [`DEPLOY.md`](
 ## Docker
 
 ```bash
-make docker-build                         # python:3.12-slim + CPU torch + docling/EasyOCR models + tokenizers baked in
+make docker-build                         # python:3.12 + CPU torch + docling/EasyOCR models + tokenizers baked in
 make docker-run                           # docker run --network host --env-file .env … (LiteLLM on localhost:4000)
 curl -s localhost:8080/healthz
 ```

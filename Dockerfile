@@ -5,7 +5,9 @@
 #                     --build-arg PIP_INDEX_URL=https://artifactory.example.internal/api/pypi/pypi/simple \
 #                     --build-arg PIP_EXTRA_INDEX_URL=https://artifactory.example.internal/api/pypi/pytorch-cpu/simple \
 #                     --build-arg HF_ENDPOINT=https://artifactory.example.internal/api/huggingfaceml/hf .
-ARG BASE_IMAGE=python:3.12-slim
+# BASE_IMAGE: python:3.12 (default; ships libGL/glib/curl, so no apt access is needed) or python:3.12-slim (smaller,
+# but the apt step below must reach deb.debian.org or a mirror).
+ARG BASE_IMAGE=python:3.12
 FROM ${BASE_IMAGE}
 
 ARG PIP_INDEX_URL=https://pypi.org/simple
@@ -26,9 +28,13 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
     DOCLING_ARTIFACTS_PATH=/opt/docling-models \
     OMP_NUM_THREADS=4
 
-# OpenCV (docling dependency) needs libGL + glib; curl is for the HEALTHCHECK.
-RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 curl \
-    && rm -rf /var/lib/apt/lists/*
+# OpenCV (docling dependency) needs libGL + glib; curl is for the HEALTHCHECK. Skipped when the base image
+# already provides them (python:3.12); on -slim this needs deb.debian.org (proxy: lowercase http_proxy vars).
+RUN if [ -e /usr/lib/x86_64-linux-gnu/libGL.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0 ] && command -v curl >/dev/null; then \
+        echo "base image provides libGL, glib and curl - skipping apt"; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 curl && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 # 1. third-party dependencies (layer survives source edits)

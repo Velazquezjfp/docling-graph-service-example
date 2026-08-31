@@ -53,7 +53,7 @@ def _via_http(url: str):
                          "base64_content": base64.b64encode(ZSD_PDF.read_bytes()).decode()},
             "pipeline_config": {},
             "ontology_graph": yaml.safe_load(ONTOLOGY_PATH.read_text(encoding="utf-8"))}
-    with httpx.Client(base_url=url, timeout=httpx.Timeout(3600, connect=10)) as client:
+    with httpx.Client(base_url=url, timeout=httpx.Timeout(3600, connect=10), trust_env=False) as client:
         r = client.post("/v1/process", json=body)
     assert r.status_code == 200, r.text[:500]
     return ProcessResponse.model_validate(r.json())

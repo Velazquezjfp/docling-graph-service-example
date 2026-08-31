@@ -60,7 +60,9 @@ def main() -> int:
     out = args.out or Path("out") / args.document.stem
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    with httpx.Client(base_url=args.url, timeout=httpx.Timeout(args.timeout, connect=10)) as client:
+    # trust_env=False: ignore http(s)_proxy shell variables — a corporate proxy must never sit between
+    # this script and the service URL (proxies drop long-running requests).
+    with httpx.Client(base_url=args.url, timeout=httpx.Timeout(args.timeout, connect=10), trust_env=False) as client:
         health = client.get("/healthz")
         print(f"healthz: {health.status_code} {health.text[:200]}")
         r = client.post("/v1/process", json=body)

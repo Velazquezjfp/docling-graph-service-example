@@ -25,6 +25,10 @@ PDF ──docling (OCR de/en, TableFormer, images_scale 3)──▶ DoclingDocum
       └──▶ graph.py    (DoclingDocument JSON → docling-graph dense contract → materialize nodes/edges)
 ```
 
+A phase-by-phase flow diagram (inputs, tools per step, outputs): [`service-flow.md`](service-flow.md).
+Inspect processed results in the browser: `python3 scripts/serve_viewer.py --dir out` (stdlib-only viewer:
+nodes/edges with provenance, source chunks, review queue — see the root README).
+
 ## Quick start (native, pip)
 
 ```bash

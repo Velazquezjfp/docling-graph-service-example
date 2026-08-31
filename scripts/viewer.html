@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docling-graph result viewer</title>
+<style>
+  :root { --line:#d7d7d7; --muted:#6b6b6b; --accent:#0b57d0; --neg:#b3261e; --bg:#fafafa; --card:#fff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:#1b1b1b; }
+  header { display:flex; gap:12px; align-items:center; padding:8px 14px; background:var(--card); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; flex-wrap:wrap;}
+  header h1 { font-size:15px; margin:0 8px 0 0; }
+  select, input[type=search] { font:inherit; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  #stats { color:var(--muted); font-size:12px; }
+  nav button { font:inherit; padding:4px 10px; border:1px solid var(--line); background:#fff; border-radius:6px; cursor:pointer; }
+  nav button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  main { display:grid; grid-template-columns: 290px 1fr 380px; gap:10px; padding:10px; height:calc(100vh - 54px); }
+  .col { overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:6px 0; }
+  details { margin:2px 0; }
+  summary { cursor:pointer; font-weight:600; }
+  summary .n { color:var(--muted); font-weight:400; }
+  ul.nodes { list-style:none; margin:2px 0 6px; padding-left:14px; }
+  ul.nodes li { cursor:pointer; padding:1px 4px; border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  ul.nodes li:hover { background:#eef3fe; }
+  ul.nodes li.sel { background:var(--accent); color:#fff; }
+  table { border-collapse:collapse; width:100%; margin:4px 0 10px; }
+  td, th { border:1px solid var(--line); padding:3px 6px; text-align:left; vertical-align:top; font-size:13px; }
+  th { background:#f2f2f2; }
+  td.k { color:var(--muted); width:32%; }
+  .edge { padding:4px 6px; border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:4px; margin:4px 0; cursor:pointer; }
+  .edge.neg { border-left-color:var(--neg); }
+  .edge:hover { background:#eef3fe; }
+  .edge .rel { font-weight:600; } .edge .pol { font-size:12px; color:var(--muted); }
+  .quote { color:#444; font-style:italic; font-size:13px; }
+  .chunk { border:1px solid var(--line); border-radius:6px; margin:8px 0; }
+  .chunk .head { padding:4px 8px; background:#f2f2f2; font-size:12px; color:var(--muted); display:flex; gap:8px; flex-wrap:wrap;}
+  .chunk pre { margin:0; padding:8px; white-space:pre-wrap; word-break:break-word; font:12px/1.5 ui-monospace, monospace; max-height:340px; overflow:auto;}
+  .badge { display:inline-block; padding:0 6px; border-radius:8px; background:#e7e7e7; font-size:11px; }
+  svg text { font:11px system-ui, sans-serif; }
+  svg .center { font-weight:700; }
+  svg line.neg { stroke:var(--neg); stroke-dasharray:4 3; }
+  svg .nodebox { cursor:pointer; }
+  #empty { color:var(--muted); padding:30px; text-align:center; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>docling-graph viewer</h1>
+  <select id="runSel"></select>
+  <nav>
+    <button id="tabGraph" class="on">Graph</button>
+    <button id="tabChunks">Chunks</button>
+    <button id="tabMeta">Meta</button>
+  </nav>
+  <input type="search" id="search" placeholder="search label / alias / id …" size="28">
+  <span id="stats"></span>
+</header>
+<main id="graphView">
+  <div class="col" id="nodeList"></div>
+  <div class="col" id="inspector"><div id="empty">Select a node on the left — or an edge — to inspect it.</div></div>
+  <div class="col" id="sources"><h2>Source chunks</h2><div id="chunkPanel"></div></div>
+</main>
+<main id="chunksView" class="hidden" style="grid-template-columns:1fr;"><div class="col" id="allChunks"></div></main>
+<main id="metaView" class="hidden" style="grid-template-columns:1fr;"><div class="col" id="metaPanel"></div></main>
+<script>
+"use strict";
+let DATA = null, nodesById = {}, chunksById = {}, edgesOf = {}, selected = null;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function loadRuns() {
+  const runs = await (await fetch("/api/runs")).json();
+  $("runSel").innerHTML = runs.map(r => `<option value="${esc(r.name)}">${esc(r.name)}</option>`).join("");
+  if (runs.length) loadRun(runs[0].name); else $("stats").textContent = "no runs found in the output folder";
+}
+async function loadRun(name) {
+  DATA = await (await fetch("/api/run/" + encodeURIComponent(name))).json();
+  nodesById = {}; chunksById = {}; edgesOf = {}; selected = null;
+  const g = DATA.graph || {nodes: [], edges: [], meta: {}};
+  g.nodes.forEach(n => { nodesById[n.id] = n; edgesOf[n.id] = []; });
+  g.edges.forEach((e, i) => { e._i = i; (edgesOf[e.source] ||= []).push(e); (edgesOf[e.target] ||= []).push(e); });
+  DATA.chunks.forEach(c => chunksById[c.chunk_id] = c);
+  $("stats").textContent = `${g.nodes.length} nodes · ${g.edges.length} edges · ${DATA.chunks.length} chunks`
+      + (DATA.graph ? "" : " · no graph in this run");
+  renderNodeList(""); renderAllChunks(""); renderMeta();
+  $("inspector").innerHTML = '<div id="empty">Select a node on the left — or an edge — to inspect it.</div>';
+  $("chunkPanel").innerHTML = "";
+}
+function renderNodeList(q) {
+  q = q.toLowerCase();
+  const groups = {};
+  (DATA.graph?.nodes || []).forEach(n => {
+    const hay = (n.label + " " + n.id + " " + (n.aliases||[]).join(" ") + " " + JSON.stringify(n.attributes)).toLowerCase();
+    if (q && !hay.includes(q)) return;
+    (groups[n.type] ||= []).push(n);
+  });
+  $("nodeList").innerHTML = "<h2>Nodes by type</h2>" + Object.keys(groups).sort().map(t => `
+    <details ${q ? "open" : ""}><summary>${esc(t)} <span class="n">(${groups[t].length})</span></summary>
+      <ul class="nodes">${groups[t].sort((a,b)=>a.label.localeCompare(b.label)).map(n =>
+        `<li data-id="${esc(n.id)}" class="${selected?.id===n.id?"sel":""}" title="${esc(n.label)}">${esc(n.label)}</li>`).join("")}
+      </ul></details>`).join("") || "<div id='empty'>no nodes</div>";
+  $("nodeList").querySelectorAll("li").forEach(li => li.onclick = () => selectNode(li.dataset.id));
+}
+function kv(obj) {
+  const rows = Object.entries(obj || {}).filter(([,v]) => v !== null && v !== "" && !(Array.isArray(v) && !v.length));
+  return rows.length ? "<table>" + rows.map(([k,v]) =>
+    `<tr><td class="k">${esc(k)}</td><td>${esc(Array.isArray(v)?v.join("; "):(typeof v==="object"?JSON.stringify(v):v))}</td></tr>`).join("") + "</table>" : "<p class='quote'>—</p>";
+}
+function edgeCard(e, from) {
+  const other = from === "out" ? e.target : e.source, dir = from === "out" ? "→" : "←";
+  return `<div class="edge ${e.polarity==="negative"?"neg":""}" data-i="${e._i}">
+    <span class="rel">${esc(e.type)}</span> <span class="pol">[${esc(e.polarity)}]</span> ${dir}
+    <b>${esc(nodesById[other]?.label || other)}</b> <span class="badge">${esc(nodesById[other]?.type || "?")}</span>
+    ${e.qualifier ? `<div class="quote">Qualifier: ${esc(e.qualifier)}</div>` : ""}
+    ${e.quote ? `<div class="quote">„${esc(e.quote)}"</div>` : ""}
+    ${Object.keys(e.properties||{}).length ? kv(e.properties) : ""}</div>`;
+}
+function selectNode(id) {
+  const n = nodesById[id]; if (!n) return;
+  selected = {kind:"node", id};
+  renderNodeList($("search").value);
+  const out = (edgesOf[id]||[]).filter(e => e.source === id), inn = (edgesOf[id]||[]).filter(e => e.target === id);
+  $("inspector").innerHTML = `
+    <h2>${esc(n.type)}</h2><h3 style="margin:2px 0 8px;">${esc(n.label)}</h3>
+    ${n.aliases?.length ? `<p>aliases: ${n.aliases.map(a=>`<span class="badge">${esc(a)}</span>`).join(" ")}</p>` : ""}
+    ${n.quote ? `<p class="quote">„${esc(n.quote)}"</p>` : ""}
+    ${kv(n.attributes)}
+    <h2>Provenance</h2>${kv({pages:n.provenance.pages, table:n.provenance.table_ref, figure:n.provenance.figure_ref,
+        section:(n.provenance.heading_breadcrumb||[]).join(" › "), match:n.provenance.match, dom:n.provenance.dom_paths})}
+    ${svgEgo(n, out, inn)}
+    <h2>Outgoing (${out.length})</h2>${out.map(e=>edgeCard(e,"out")).join("")||"<p class='quote'>—</p>"}
+    <h2>Incoming (${inn.length})</h2>${inn.map(e=>edgeCard(e,"in")).join("")||"<p class='quote'>—</p>"}`;
+  bindEdges(); showChunks(n.provenance.chunk_ids, `chunks of ${n.label}`);
+  document.querySelectorAll("#inspector .nodebox").forEach(g => g.onclick = () => selectNode(g.dataset.id));
+}
+function selectEdge(i) {
+  const e = (DATA.graph?.edges||[])[i]; if (!e) return;
+  selected = {kind:"edge", i};
+  $("inspector").innerHTML = `
+    <h2>Edge</h2>
+    <h3 style="margin:2px 0 8px;">${esc(nodesById[e.source]?.label)} —${esc(e.type)}→ ${esc(nodesById[e.target]?.label)}</h3>
+    ${kv({type:e.type, polarity:e.polarity, qualifier:e.qualifier, quote:e.quote, ...e.properties})}
+    <p><span class="edge" data-i="src">source: <b>${esc(nodesById[e.source]?.label)}</b></span>
+       <span class="edge" data-i="tgt">target: <b>${esc(nodesById[e.target]?.label)}</b></span></p>`;
+  $("inspector").querySelector('[data-i="src"]').onclick = () => selectNode(e.source);
+  $("inspector").querySelector('[data-i="tgt"]').onclick = () => selectNode(e.target);
+  showChunks(e.provenance.chunk_ids, "chunks grounding this edge");
+}
+function bindEdges() { document.querySelectorAll("#inspector .edge[data-i]").forEach(d => {
+  if (d.dataset.i !== "src" && d.dataset.i !== "tgt") d.onclick = () => selectEdge(+d.dataset.i); }); }
+function svgEgo(n, out, inn) {
+  const nb = [...new Map([...out.map(e=>[e.target,e]), ...inn.map(e=>[e.source,e])]).entries()]
+      .filter(([id]) => id !== n.id).slice(0, 16);
+  if (!nb.length) return "";
+  const W=760, H=Math.max(300, 90+nb.length*22), cx=W/2, cy=H/2, R=Math.min(cx-150, cy-30);
+  let s = `<h2>Neighbourhood (1 hop)</h2><svg viewBox="0 0 ${W} ${H}" style="width:100%;border:1px solid var(--line);border-radius:6px;background:#fff;">`;
+  nb.forEach(([id, e], i) => {
+    const a = -Math.PI/2 + i*2*Math.PI/nb.length, x = cx+R*Math.cos(a), y = cy+R*Math.sin(a);
+    const neg = e.polarity === "negative" ? "neg" : "";
+    s += `<line class="${neg}" x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="#999"></line>
+          <text x="${(cx+x)/2}" y="${(cy+y)/2 - 3}" text-anchor="middle" fill="#666">${esc(e.type)}${e.polarity==="negative"?" ⊘":""}</text>
+          <g class="nodebox" data-id="${esc(id)}"><circle cx="${x}" cy="${y}" r="6" fill="#0b57d0"></circle>
+          <text x="${x}" y="${y - 10}" text-anchor="middle">${esc((nodesById[id]?.label||id).slice(0,28))}</text></g>`;
+  });
+  s += `<circle cx="${cx}" cy="${cy}" r="8" fill="#1b1b1b"></circle>
+        <text class="center" x="${cx}" y="${cy - 12}" text-anchor="middle">${esc(n.label.slice(0,30))}</text></svg>`;
+  return s;
+}
+function chunkCard(c) {
+  return `<div class="chunk"><div class="head">
+      <b>${esc(c.chunk_id)}</b><span class="badge">${esc(c.kind)}</span>
+      <span>p. ${esc((c.page_numbers||[]).join(", "))}</span><span>${esc(c.token_count)} tok</span>
+      ${c.caption ? `<span>${esc(c.caption)}</span>` : ""}
+      <span>${esc((c.heading_breadcrumb||[]).join(" › "))}</span></div>
+    <pre>${esc(c.body_text)}</pre></div>`;
+}
+function showChunks(ids, title) {
+  const cs = (ids||[]).map(id => chunksById[id]).filter(Boolean);
+  $("chunkPanel").innerHTML = `<p class="quote">${esc(title)} (${cs.length})</p>` +
+    (cs.map(chunkCard).join("") || "<p class='quote'>no chunks recorded</p>");
+}
+function renderAllChunks(q) {
+  q = q.toLowerCase();
+  const cs = DATA.chunks.filter(c => !q || (c.text + " " + (c.caption||"")).toLowerCase().includes(q));
+  $("allChunks").innerHTML = `<h2>All chunks (${cs.length})</h2>` + cs.map(chunkCard).join("");
+}
+function renderMeta() {
+  const m = DATA.graph?.meta || {}, s = DATA.summary || {};
+  const tbl = rows => rows?.length ? "<table><tr>" + Object.keys(rows[0]).map(k=>`<th>${esc(k)}</th>`).join("") + "</tr>" +
+      rows.map(r=>"<tr>"+Object.values(r).map(v=>`<td>${esc(typeof v==="object"?JSON.stringify(v):v)}</td>`).join("")+"</tr>").join("") + "</table>" : "<p class='quote'>—</p>";
+  $("metaPanel").innerHTML = `
+    <h2>Run summary</h2>${kv(s.document||{})}${kv({degraded:JSON.stringify(s.degraded), errors:(s.errors||[]).join(" | "), timings:JSON.stringify(s.timings_s)})}
+    <h2>Nodes by type</h2>${kv(m.nodes_by_type)}<h2>Edges by type</h2>${kv(m.edges_by_type)}
+    <h2>Edges by polarity</h2>${kv(m.edges_by_polarity)}
+    <h2>Unresolved targets (review queue, not materialized)</h2>${tbl(m.unresolved_targets)}
+    <h2>Conflicts (positive + negative for the same edge)</h2>${tbl(m.conflicts)}
+    <h2>Identity pattern violations (kept + flagged)</h2>${tbl(m.identity_pattern_violations)}
+    <h2>Enum violations</h2>${tbl(m.enum_violations)}
+    <h2>Polarity notes</h2><p>${(m.polarity_notes||[]).map(esc).join("<br>")||"—"}</p>
+    <h2>Ontology / versions</h2>${kv({ontology:JSON.stringify(m.ontology), schema:m.template_schema_hash, docling_graph:m.docling_graph_version, alias_reconciliation:JSON.stringify(m.alias_reconciliation)})}`;
+}
+function tab(which) {
+  ["Graph","Chunks","Meta"].forEach(t => {
+    $("tab"+t).classList.toggle("on", t === which);
+    $(t==="Graph"?"graphView":t==="Chunks"?"chunksView":"metaView").classList.toggle("hidden", t !== which);
+  });
+}
+$("tabGraph").onclick = () => tab("Graph");
+$("tabChunks").onclick = () => tab("Chunks");
+$("tabMeta").onclick = () => tab("Meta");
+$("runSel").onchange = e => loadRun(e.target.value);
+$("search").oninput = e => { renderNodeList(e.target.value); renderAllChunks(e.target.value); };
+loadRuns();
+</script>
+</body>
+</html>

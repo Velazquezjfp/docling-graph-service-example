@@ -13,6 +13,10 @@ Probes, in order:
   openai-string   /v1/chat/completions -> "image_url" as a bare data-URL string (some gateways)
   native-chat     Ollama /api/chat     -> messages[0].images = [<raw base64, no data: prefix>]
   native-generate Ollama /api/generate -> prompt + images = [<raw base64>]
+  native-chat-pre same as native-chat, but with an OCR-preprocessed image (white background,
+                  patch-snapped LANCZOS resize, autocontrast — deliberately NO sharpening,
+                  which measurably hurt gemma4) — A/B against native-chat to see whether
+                  preprocessing lifts reading fidelity. Needs Pillow; skipped otherwise.
 
 Usage (remote server, against the tunnel):
     python3 test_vlm.py --url http://localhost:11435 --model gemma4:latest
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import sys
@@ -97,6 +102,45 @@ def load_image(path: Path) -> tuple[str, str]:
     return b64, f"data:{mime};base64,{b64}"
 
 
+def preprocess_image(path: Path, max_dim: int = 1540, patch: int = 14) -> tuple[str, str] | None:
+    """OCR-friendly preprocessing for ViT-style vision encoders. Returns (base64, note), or
+    None when Pillow is missing. The result is also saved as <image>-pre.png for eyeballing."""
+    try:
+        from PIL import Image, ImageOps, ImageStat
+    except ImportError:
+        return None
+    img = Image.open(path)
+    # flatten transparency onto white — encoders render alpha as black, drowning dark text
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        img = img.convert("RGBA")
+        img = Image.alpha_composite(Image.new("RGBA", img.size, (255, 255, 255, 255)), img)
+    img = img.convert("RGB")
+    # invert dark-mode diagrams: encoders and OCR are trained mostly on dark-on-light
+    if ImageStat.Stat(img.convert("L")).mean[0] < 80:
+        img = ImageOps.invert(img)
+    # high-quality LANCZOS downscale snapped to the encoder's patch grid — better to do the
+    # resize ourselves than let the server do it with a cheap filter
+    w, h = img.size
+    scale = min(max_dim / max(w, h), 1.0)
+    tw = max(patch, round(w * scale / patch) * patch)
+    th = max(patch, round(h * scale / patch) * patch)
+    if (tw, th) != (w, h):
+        img = img.resize((tw, th), Image.Resampling.LANCZOS)
+    # adaptive contrast stretch. NO sharpening: an unsharp mask measurably DEGRADED gemma4's
+    # reading (halos read as noise after the encoder's own downsampling) — bisected 2026-09-01.
+    img = ImageOps.autocontrast(img, cutoff=1)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    out = path.with_name(path.stem + "-pre.png")
+    try:
+        out.write_bytes(buf.getvalue())
+        saved = f"saved as {out.name}"
+    except OSError:
+        saved = "not saved (directory read-only)"
+    note = f"{w}x{h} -> {img.width}x{img.height}, patch-snapped LANCZOS + autocontrast, {saved}"
+    return base64.b64encode(buf.getvalue()).decode("ascii"), note
+
+
 def count_hits(text: str) -> tuple[int, int, int]:
     low = text.casefold()
     return (sum(1 for t in SPECIFIC_TOKENS if t.casefold() in low),
@@ -161,11 +205,11 @@ def probe_show(base: str, model: str, api_key: str | None, timeout: float) -> li
 
 
 def build_variants(model: str, prompt: str, b64: str, data_url: str, max_tokens: int,
-                   thinking: bool) -> dict:
+                   thinking: bool, b64_pre: str | None = None) -> dict:
     # think:false only where the API supports it (native) and the model declares thinking —
     # otherwise a thinking model burns the whole token budget on hidden reasoning.
     think = {"think": False} if thinking else {}
-    return {
+    variants = {
         "openai-object": ("/v1/chat/completions", {
             "model": model, "temperature": 0.0, "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": [
@@ -190,6 +234,19 @@ def build_variants(model: str, prompt: str, b64: str, data_url: str, max_tokens:
             "options": {"temperature": 0.0, "num_predict": max_tokens},
         }),
     }
+    if b64_pre is not None:
+        # Same call as native-chat, but with the OCR-preprocessed image — A/B for fidelity.
+        # The prompt gets a distinct first line: Ollama's prompt-prefix cache matches the text
+        # tokens of the previous same-prompt call and then reuses stale image state for the NEW
+        # image (empty EOS replies, reproduced on gemma4 AND qwen3.5) — a token-distinct prefix
+        # forces a clean prefill.
+        variants["native-chat-pre"] = ("/api/chat", {
+            "model": model, "stream": False, **think,
+            "messages": [{"role": "user", "content": "Neues Bild, neue Aufgabe.\n" + prompt,
+                          "images": [b64_pre]}],
+            "options": {"temperature": 0.0, "num_predict": max_tokens},
+        })
+    return variants
 
 
 def extract_reply(name: str, body) -> tuple[str, str, str]:
@@ -222,7 +279,13 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--max-tokens", type=int, default=1200,
                     help="generous default: thinking models spend tokens before answering")
-    ap.add_argument("--variants", default="openai-object,openai-string,native-chat,native-generate")
+    ap.add_argument("--variants",
+                    default="openai-object,openai-string,native-chat,native-generate,native-chat-pre")
+    ap.add_argument("--pre-max-dim", type=int, default=1540,
+                    help="max dimension for the preprocessed image (native-chat-pre variant)")
+    ap.add_argument("--pre-patch", type=int, default=14,
+                    help="ViT patch grid the resize snaps to: 14 for gemma-style encoders, "
+                         "28 for the qwen-VL family (14px patches merged 2x2)")
     args = ap.parse_args()
 
     base = args.url.rstrip("/")
@@ -248,22 +311,56 @@ def main() -> int:
         print("  -> model tag has NO vision capability. No request format can fix this —")
         print("     Ollama silently drops the images. Pull a vision-capable tag of the model.")
 
+    pre = preprocess_image(args.image, args.pre_max_dim, args.pre_patch)
+    if pre is None:
+        print("\n(Pillow not installed — skipping the native-chat-pre variant."
+              " `pip install pillow` to enable it.)")
+        b64_pre = None
+    else:
+        b64_pre, pre_note = pre
+        print(f"\npreprocessed image: {pre_note} ({len(b64_pre) // 1024} KiB as base64)")
+
     results: dict[str, tuple[str, str]] = {}
-    variants = build_variants(args.model, PROMPT, b64, data_url, args.max_tokens, thinking)
+    variants = build_variants(args.model, PROMPT, b64, data_url, args.max_tokens, thinking, b64_pre)
     for name in [v.strip() for v in args.variants.split(",") if v.strip()]:
+        if name == "native-chat-pre" and b64_pre is None:
+            continue  # Pillow missing, already announced
         if name not in variants:
             print(f"unknown variant: {name}", file=sys.stderr)
             continue
         path, payload = variants[name]
         print(f"\n== variant: {name}  POST {base}{path}")
-        status, body, dt = http_json(f"{base}{path}", payload, args.api_key, args.timeout)
+        # breathe between requests: firing within milliseconds of the previous response
+        # reproduces an Ollama runner race that returns empty multimodal replies
+        time.sleep(3.0)
+        for attempt in (1, 2):
+            status, body, dt = http_json(f"{base}{path}", payload, args.api_key, args.timeout)
+            if status >= 400:
+                break
+            reply, reasoning, note = extract_reply(name, body)
+            if reply.strip() or reasoning or "length" in note or attempt == 2:
+                break
+            # Empty answer without truncation: observed as an Ollama runner bug — the byte-
+            # identical request (verified via a logging relay, same body sha) fails when its
+            # multimodal prefill directly follows /api/show or a model (re)load, and succeeds
+            # after any completed chat. So: complete a tiny text-only chat, then retry.
+            print(f"  empty reply ({note}) after {dt:.1f}s — warmup chat, then retrying once")
+            try:
+                http_json(f"{base}/api/chat", {
+                    "model": args.model, "stream": False,
+                    "messages": [{"role": "user", "content": "Sag OK."}],
+                    "options": {"num_predict": 10},
+                }, args.api_key, 120)
+            except Exception:  # noqa: BLE001 - warmup is best-effort
+                pass
         if status >= 400:
             err = body.get("error") if isinstance(body, dict) else body
             print(f"  HTTP {status} after {dt:.1f}s: {str(err)[:300]}")
             results[name] = ("ERROR", f"HTTP {status}")
             continue
-        reply, reasoning, note = extract_reply(name, body)
         verdict, (specific, title, generic) = grade(reply, reasoning)
+        if verdict == "TRUNCATED" and "length" not in note:
+            verdict = "EMPTY"
         results[name] = (verdict, f"{specific} fine-print / {title} title / {generic} generic")
         print(f"  HTTP {status} in {dt:.1f}s  {note}")
         print(f"  reply: {show_reply(reply) or '(empty)'}")
@@ -280,11 +377,17 @@ def main() -> int:
         elif verdict == "TRUNCATED":
             print("     empty answer, finish=length: no room for a visible reply — retry with"
                   " a higher --max-tokens before drawing conclusions.")
+        elif verdict == "EMPTY":
+            print("     model returned nothing twice without hitting the token limit — flaky"
+                  " model/serving; re-run before drawing conclusions.")
 
     print("\n==== SUMMARY " + "=" * 47)
     print(f"  vision capability: {'yes' if vision else 'NO' if vision is False else 'unknown (no /api/show)'}")
     for name, (verdict, detail) in results.items():
         print(f"  {name:<16} {verdict:<8} {detail}")
+    if "native-chat" in results and "native-chat-pre" in results:
+        print(f"\n  preprocessing A/B:  plain    [{results['native-chat'][0]}] {results['native-chat'][1]}")
+        print(f"                      prepped  [{results['native-chat-pre'][0]}] {results['native-chat-pre'][1]}")
 
     prod = results.get("openai-object", ("SKIPPED", ""))[0]
     natives = [results[n][0] for n in ("native-chat", "native-generate") if n in results]
